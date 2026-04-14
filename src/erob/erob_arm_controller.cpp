@@ -888,33 +888,39 @@ void ErobArmController::cycleLoop() {
 
     while (running_.load(std::memory_order_acquire)) {
         next_tick += cycle_time;
-        const int wkc = master_.receiveProcessData(EC_TIMEOUTRET);
-        if (master_.expectedWkc() > 0 && wkc < master_.expectedWkc()) {
-            wkc_miss_count_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            wkc_miss_count_.store(0, std::memory_order_relaxed);
-        }
-
-        for (const std::unique_ptr<ErobAxis>& axis_ptr : axes_) {
-            if (axis_ptr == nullptr || !axis_ptr->hasBoundMotor()) {
-                continue;
+        {
+            std::lock_guard<std::mutex> bus_lock(master_.busMutex());
+            const int wkc = master_.receiveProcessDataNoLock(EC_TIMEOUTRET);
+            const int expected_wkc = master_.expectedWkcNoLock();
+            if (expected_wkc > 0 && wkc < expected_wkc) {
+                wkc_miss_count_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                wkc_miss_count_.store(0, std::memory_order_relaxed);
             }
 
-            TxPdoCommon feedback{};
-            if (master_.readAxisFeedback(axis_ptr->slaveIndex(), &feedback)) {
-                axis_ptr->updateFeedback(feedback, master_.slaveAlStatusCode(axis_ptr->slaveIndex()));
-            }
-        }
+            for (const std::unique_ptr<ErobAxis>& axis_ptr : axes_) {
+                if (axis_ptr == nullptr || !axis_ptr->hasBoundMotor()) {
+                    continue;
+                }
 
-        for (const std::unique_ptr<ErobAxis>& axis_ptr : axes_) {
-            if (axis_ptr == nullptr || !axis_ptr->hasBoundMotor()) {
-                continue;
+                TxPdoCommon feedback{};
+                if (master_.readAxisFeedbackNoLock(axis_ptr->slaveIndex(), &feedback)) {
+                    axis_ptr->updateFeedback(
+                        feedback,
+                        master_.slaveAlStatusCodeNoLock(axis_ptr->slaveIndex()));
+                }
             }
-            const RxPdoUnified command = axis_ptr->buildRxPdoForCycle(config_.ethercat_cycle_hz);
-            master_.writeAxisCommand(axis_ptr->slaveIndex(), command);
-        }
 
-        master_.sendProcessData();
+            for (const std::unique_ptr<ErobAxis>& axis_ptr : axes_) {
+                if (axis_ptr == nullptr || !axis_ptr->hasBoundMotor()) {
+                    continue;
+                }
+                const RxPdoUnified command = axis_ptr->buildRxPdoForCycle(config_.ethercat_cycle_hz);
+                master_.writeAxisCommandNoLock(axis_ptr->slaveIndex(), command);
+            }
+
+            master_.sendProcessDataNoLock();
+        }
 
         std::this_thread::sleep_until(next_tick);
     }
@@ -942,16 +948,27 @@ void ErobArmController::monitorLoop() {
     const auto monitor_time = std::chrono::milliseconds(100);
     int monitor_iteration = 0;
     while (running_.load(std::memory_order_acquire)) {
-        const bool communication_issue =
-            wkc_miss_count_.load(std::memory_order_relaxed) >= 3 ||
-            !master_.allSlavesOperational();
+        bool communication_issue = false;
+        {
+            std::lock_guard<std::mutex> bus_lock(master_.busMutex());
+            communication_issue =
+                wkc_miss_count_.load(std::memory_order_relaxed) >= 3 ||
+                !master_.allSlavesOperationalNoLock();
+        }
 
         if (communication_issue) {
-            const bool recovered = master_.recoverSlaves();
-            if (!master_.allSlavesOperational()) {
-                master_.requestOperational();
+            bool recovered = false;
+            bool all_operational = false;
+            {
+                std::lock_guard<std::mutex> bus_lock(master_.busMutex());
+                recovered = master_.recoverSlavesNoLock();
+                all_operational = master_.allSlavesOperationalNoLock();
+                if (!all_operational) {
+                    master_.requestOperationalNoLock();
+                    all_operational = master_.allSlavesOperationalNoLock();
+                }
             }
-            if (recovered || master_.allSlavesOperational()) {
+            if (recovered || all_operational) {
                 recovery_fail_count_.store(0, std::memory_order_relaxed);
             } else {
                 const int failures = recovery_fail_count_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -984,7 +1001,12 @@ void ErobArmController::monitorLoop() {
             }
 
             uint16_t error_code = 0;
-            if (master_.sdoReadU16(axis_ptr->slaveIndex(), 0x603F, 0x00, &error_code)) {
+            bool read_ok = false;
+            {
+                std::lock_guard<std::mutex> bus_lock(master_.busMutex());
+                read_ok = master_.sdoReadU16NoLock(axis_ptr->slaveIndex(), 0x603F, 0x00, &error_code);
+            }
+            if (read_ok) {
                 axis_ptr->updateLastErrorCode(static_cast<int>(error_code));
             }
         }
@@ -1029,9 +1051,10 @@ bool ErobArmController::canRescan() const {
 bool ErobArmController::applyProfilePositionParams(
     uint16_t slave_index,
     const ProfilePositionParams& params) {
-    if (!master_.sdoWriteU32(slave_index, 0x6081, 0x00, params.profile_velocity) ||
-        !master_.sdoWriteU32(slave_index, 0x6083, 0x00, params.profile_acceleration) ||
-        !master_.sdoWriteU32(slave_index, 0x6084, 0x00, params.profile_deceleration)) {
+    std::lock_guard<std::mutex> bus_lock(master_.busMutex());
+    if (!master_.sdoWriteU32NoLock(slave_index, 0x6081, 0x00, params.profile_velocity) ||
+        !master_.sdoWriteU32NoLock(slave_index, 0x6083, 0x00, params.profile_acceleration) ||
+        !master_.sdoWriteU32NoLock(slave_index, 0x6084, 0x00, params.profile_deceleration)) {
         setLastError("failed to update profile position parameters");
         return false;
     }
