@@ -1,0 +1,81 @@
+system:
+  preferred_adapter:
+  ethercat_cycle_hz: 1000
+  follow_control_hz: 60
+  fault_policy: all_stop
+
+axes:
+  - logical_axis_id: 0
+    joint_name: base
+    motor_serial: EROB-A001
+    motor_eep_man: 0
+    motor_eep_id: 0
+    motor_eep_rev: 0
+    counts_per_degree: 1456.3
+    home_offset_count: 0
+    profile_position_timeout_ms: 10000
+    min_angle_deg: -130.0
+    max_angle_deg: 130.0
+    max_velocity_deg_s: 180.0
+    max_accel_deg_s2: 300.0
+    max_decel_deg_s2: 300.0
+    follow:
+      kp: 8.0
+      kd: 0.15
+      deadband_deg: 0.05
+      max_velocity_deg_s: 250.0
+      max_accel_deg_s2: 600.0
+      max_decel_deg_s2: 600.0
+      target_filter_alpha: 0.4
+      watchdog_timeout_ms: 50.0
+      position_limit_margin_deg: 5.0
+
+  - logical_axis_id: 1
+    joint_name: shoulder
+    motor_serial: EROB-A002
+    motor_eep_man: 0
+    motor_eep_id: 0
+    motor_eep_rev: 0
+    counts_per_degree: 1820.0
+    home_offset_count: 0
+    profile_position_timeout_ms: 10000
+    min_angle_deg: -130.0
+    max_angle_deg: 130.0
+    max_velocity_deg_s: 150.0
+    max_accel_deg_s2: 240.0
+    max_decel_deg_s2: 240.0
+    follow:
+      kp: 7.5
+      kd: 0.18
+      deadband_deg: 0.05
+      max_velocity_deg_s: 220.0
+      max_accel_deg_s2: 550.0
+      max_decel_deg_s2: 550.0
+      target_filter_alpha: 0.4
+      watchdog_timeout_ms: 50.0
+      position_limit_margin_deg: 5.0
+
+  - logical_axis_id: 2
+    joint_name: elbow
+    motor_serial: EROB-A003
+    motor_eep_man: 0
+    motor_eep_id: 0
+    motor_eep_rev: 0
+    counts_per_degree: 1820.0
+    home_offset_count: 0
+    profile_position_timeout_ms: 10000
+    min_angle_deg: -130.0
+    max_angle_deg: 130.0
+    max_velocity_deg_s: 150.0
+    max_accel_deg_s2: 240.0
+    max_decel_deg_s2: 240.0
+    follow:
+      kp: 7.5
+      kd: 0.18
+      deadband_deg: 0.05
+      max_velocity_deg_s: 220.0
+      max_accel_deg_s2: 550.0
+      max_decel_deg_s2: 550.0
+      target_filter_alpha: 0.4
+      watchdog_timeout_ms: 50.0
+      position_limit_margin_deg: 5.0

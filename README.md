@@ -35,6 +35,79 @@ make
 
 ```
 
+## Python Integration
+
+The repository now provides a C ABI shared library for Python callers:
+
+```bash
+cmake -S . -B build
+cmake --build build --target erob_c_api erob_arm_demo -j4
+```
+
+The shared library is generated at:
+
+```text
+build/demo/liberob_c_api.so
+```
+
+Python wrapper files are located in:
+
+```text
+python/erob/
+```
+
+Minimal Python usage:
+
+```python
+from erob.sdk import ErobController
+
+controller = ErobController(
+   config_path="config/erob_arm.yaml",
+   library_path="build/demo/liberob_c_api.so",
+)
+
+controller.initialize()
+controller.enable_axis(0)
+controller.move_to(0, 15.0, 40.0)
+controller.start_follow(0)
+controller.update_follow_target(0, 25.0)
+controller.stop_follow(0)
+controller.shutdown()
+controller.close()
+```
+
+If the library is not in the default build path, you can also set:
+
+```bash
+export EROB_C_API_LIB=/absolute/path/to/liberob_c_api.so
+```
+
+## PyQt Control Console
+
+The new desktop control console includes:
+
+- Adapter scan and motor rescan.
+- Preferred adapter selection before initialize.
+- Three independent axis cards.
+- enable, disable, reset fault, axis quick stop, and global quick stop.
+- PP moveTo command input.
+- CSV follow control using a dial that continuously sends target angles.
+- State refresh, binding report display, and discovered motor tables.
+
+Install the GUI dependency:
+
+```bash
+python3 -m pip install -r python/requirements.txt
+```
+
+Launch the control console:
+
+```bash
+PYTHONPATH=python python3 python/run_gui.py
+```
+
+When running against real hardware, use sudo or appropriate permissions for the EtherCAT adapter.
+
 ## Usage
 ### Running demo:
 
