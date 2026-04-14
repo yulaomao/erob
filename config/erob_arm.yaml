@@ -15,8 +15,8 @@ axes:
     counts_per_degree: 1456.3
     home_offset_count: 0
     profile_position_timeout_ms: 10000
-    min_angle_deg: -130.0
-    max_angle_deg: 130.0
+    min_angle_deg: -135.0
+    max_angle_deg: 135.0
     max_velocity_deg_s: 180.0
     max_accel_deg_s2: 300.0
     max_decel_deg_s2: 300.0
@@ -39,8 +39,8 @@ axes:
     counts_per_degree: 1820.0
     home_offset_count: 0
     profile_position_timeout_ms: 10000
-    min_angle_deg: -130.0
-    max_angle_deg: 130.0
+    min_angle_deg: -135.0
+    max_angle_deg: 135.0
     max_velocity_deg_s: 150.0
     max_accel_deg_s2: 240.0
     max_decel_deg_s2: 240.0
@@ -63,8 +63,8 @@ axes:
     counts_per_degree: 1820.0
     home_offset_count: 0
     profile_position_timeout_ms: 10000
-    min_angle_deg: -130.0
-    max_angle_deg: 130.0
+    min_angle_deg: -135.0
+    max_angle_deg: 135.0
     max_velocity_deg_s: 150.0
     max_accel_deg_s2: 240.0
     max_decel_deg_s2: 240.0

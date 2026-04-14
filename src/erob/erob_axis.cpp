@@ -4,6 +4,13 @@
 
 namespace erob {
 
+namespace {
+
+constexpr double kFollowInputMinAngleDeg = -130.0;
+constexpr double kFollowInputMaxAngleDeg = 130.0;
+
+}  // namespace
+
 ErobAxis::ErobAxis(const AxisConfig& config)
     : config_(config),
       state_buffer_(AxisState{}),
@@ -211,6 +218,9 @@ bool ErobAxis::updateFollowTarget(double angle_deg) {
         setLastError("follow mode is not active");
         return false;
     }
+    if (angle_deg < kFollowInputMinAngleDeg || angle_deg > kFollowInputMaxAngleDeg) {
+        return true;
+    }
     follow_target_deg_.store(clampAngle(angle_deg), std::memory_order_release);
     last_follow_target_ns_.store(SteadyClockNowNs(), std::memory_order_release);
     return true;
@@ -290,14 +300,26 @@ void ErobAxis::planFollowStep() {
     double desired_velocity = 0.0;
     const double raw_target = follow_target_deg_.load(std::memory_order_acquire);
     const double clamped_target = clampAngle(raw_target);
-    planner_filtered_target_deg_ =
-        config_.follow.target_filter_alpha * clamped_target +
-        (1.0 - config_.follow.target_filter_alpha) * planner_filtered_target_deg_;
-
-    const double limit_hold_band_deg = std::max(0.5, config_.follow.deadband_deg * 10.0);
-    const double limit_release_band_deg = limit_hold_band_deg * 2.0;
+    const double limit_hold_band_deg = std::max(2.0, config_.follow.position_limit_margin_deg * 0.4);
+    const double limit_settle_deg = 1.0;
+    const double limit_capture_velocity_deg_s =
+        std::max(2.0, config_.follow.max_velocity_deg_s * 0.03);
+    const double limit_soft_target_offset_deg = limit_hold_band_deg;
+    const double limit_release_band_deg = limit_hold_band_deg + 1.0;
     const bool target_at_positive_limit = clamped_target >= (config_.max_angle_deg - 1e-6);
     const bool target_at_negative_limit = clamped_target <= (config_.min_angle_deg + 1e-6);
+    const bool target_near_positive_limit = clamped_target >= (config_.max_angle_deg - limit_hold_band_deg);
+    const bool target_near_negative_limit = clamped_target <= (config_.min_angle_deg + limit_hold_band_deg);
+    double effective_target_deg = clamped_target;
+    if (target_at_positive_limit) {
+        effective_target_deg = config_.max_angle_deg - limit_soft_target_offset_deg;
+    } else if (target_at_negative_limit) {
+        effective_target_deg = config_.min_angle_deg + limit_soft_target_offset_deg;
+    }
+    planner_filtered_target_deg_ =
+        config_.follow.target_filter_alpha * effective_target_deg +
+        (1.0 - config_.follow.target_filter_alpha) * planner_filtered_target_deg_;
+
 
     if (follow_positive_limit_hold_ && clamped_target < (config_.max_angle_deg - limit_release_band_deg)) {
         follow_positive_limit_hold_ = false;
@@ -306,25 +328,7 @@ void ErobAxis::planFollowStep() {
         follow_negative_limit_hold_ = false;
     }
 
-    if (!follow_positive_limit_hold_ && !follow_negative_limit_hold_) {
-        if (target_at_positive_limit &&
-            state.actual_angle_deg >= (config_.max_angle_deg - limit_hold_band_deg)) {
-            follow_positive_limit_hold_ = true;
-        } else if (target_at_negative_limit &&
-                   state.actual_angle_deg <= (config_.min_angle_deg + limit_hold_band_deg)) {
-            follow_negative_limit_hold_ = true;
-        }
-    }
-
-    const bool holding_limit = follow_positive_limit_hold_ || follow_negative_limit_hold_;
-    if (holding_limit) {
-        planner_filtered_target_deg_ = Clamp(
-            state.actual_angle_deg,
-            config_.min_angle_deg,
-            config_.max_angle_deg);
-        desired_velocity = 0.0;
-        planner_velocity_deg_s_ = 0.0;
-    } else {
+    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
         const double error = planner_filtered_target_deg_ - state.actual_angle_deg;
         if (std::fabs(error) > config_.follow.deadband_deg) {
             desired_velocity = config_.follow.kp * error - config_.follow.kd * state.actual_velocity_deg_s;
@@ -336,7 +340,7 @@ void ErobAxis::planFollowStep() {
         -config_.follow.max_velocity_deg_s,
         config_.follow.max_velocity_deg_s);
 
-    if (!holding_limit) {
+    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
         const double max_accel = desired_velocity >= planner_velocity_deg_s_
             ? config_.follow.max_accel_deg_s2
             : config_.follow.max_decel_deg_s2;
@@ -346,6 +350,36 @@ void ErobAxis::planFollowStep() {
         } else {
             desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
         }
+    }
+
+    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
+        const double pos_error = std::fabs(effective_target_deg - state.actual_angle_deg);
+        const double limited_velocity_for_hold = applyVelocityLimiter(state, desired_velocity);
+        const bool can_capture_positive_limit =
+            target_near_positive_limit &&
+            state.actual_angle_deg >= (config_.max_angle_deg - limit_hold_band_deg) &&
+            (pos_error < limit_settle_deg ||
+             std::fabs(limited_velocity_for_hold) <= limit_capture_velocity_deg_s);
+        const bool can_capture_negative_limit =
+            target_near_negative_limit &&
+            state.actual_angle_deg <= (config_.min_angle_deg + limit_hold_band_deg) &&
+            (pos_error < limit_settle_deg ||
+             std::fabs(limited_velocity_for_hold) <= limit_capture_velocity_deg_s);
+
+        if (can_capture_positive_limit) {
+            follow_positive_limit_hold_ = true;
+        } else if (can_capture_negative_limit) {
+            follow_negative_limit_hold_ = true;
+        }
+    }
+
+    const bool holding_limit = follow_positive_limit_hold_ || follow_negative_limit_hold_;
+    if (holding_limit) {
+        planner_filtered_target_deg_ = Clamp(
+            state.actual_angle_deg,
+            config_.min_angle_deg,
+            config_.max_angle_deg);
+        desired_velocity = 0.0;
     }
 
     planner_velocity_deg_s_ = desired_velocity;
@@ -652,6 +686,12 @@ double ErobAxis::applyVelocityLimiter(const AxisState& state, double velocity_de
         const double remaining = state.actual_angle_deg - config_.min_angle_deg;
         const double scale = Clamp(remaining / margin, 0.0, 1.0);
         limited *= scale;
+    }
+    const bool in_limit_zone =
+        state.actual_angle_deg > (config_.max_angle_deg - margin) ||
+        state.actual_angle_deg < (config_.min_angle_deg + margin);
+    if (in_limit_zone && std::fabs(limited) > 1e-9 && std::fabs(limited) < 0.5) {
+        limited = 0.0;
     }
     if (state.actual_angle_deg >= config_.max_angle_deg) {
         limited = std::min(limited, 0.0);

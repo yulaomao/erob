@@ -94,8 +94,8 @@ struct AxisConfig {
     double home_offset_deg = 0.0;
     int32_t home_offset_count = 0;
     int profile_position_timeout_ms = 10000;
-    double min_angle_deg = -130.0;
-    double max_angle_deg = 130.0;
+    double min_angle_deg = -135.0;
+    double max_angle_deg = 135.0;
     double max_velocity_deg_s = 180.0;
     double max_accel_deg_s2 = 360.0;
     double max_decel_deg_s2 = 360.0;
