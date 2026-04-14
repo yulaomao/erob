@@ -451,7 +451,6 @@ class MainWindow(QMainWindow):
         if not self.binding_reports:
             self._refresh_binding_reports()
         self._populate_axis_table(states)
-        self._sync_follow_dial_from_state()
         self._update_selection_summary()
         self._update_overview_summary(states)
         self._update_header_status(states)
@@ -749,9 +748,7 @@ class MainWindow(QMainWindow):
             return
         if self.axis_states:
             axis_id = selected_axes[0]
-            if axis_id < len(self.axis_states):
-                self._pending_follow_target = self.axis_states[axis_id].actual_angle_deg
-                self.follow_target_label.setText(f"目标: {self._pending_follow_target:.1f}°")
+            self._prime_follow_dial_from_axis(axis_id)
         self.submit(
             "start-follow-selected",
             lambda axes=selected_axes: self._run_axis_batch(axes, self.controller.start_follow),
@@ -783,16 +780,11 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def _sync_follow_dial_from_state(self) -> None:
-        if self._follow_timer.isActive():
+    def _prime_follow_dial_from_axis(self, axis_id: int) -> None:
+        if not self.axis_states or axis_id >= len(self.axis_states):
             return
-        selected_follow_axes = self._selected_follow_axes()
-        if not selected_follow_axes or not self.axis_states:
-            return
-        axis_id = selected_follow_axes[0]
-        if axis_id >= len(self.axis_states):
-            return
-        target_angle = self.axis_states[axis_id].target_angle_deg
+        target_angle = self.axis_states[axis_id].actual_angle_deg
+        self._pending_follow_target = target_angle
         self.follow_dial.blockSignals(True)
         self.follow_dial.setValue(int(target_angle * self._dial_scale))
         self.follow_dial.blockSignals(False)
