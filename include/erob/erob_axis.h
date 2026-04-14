@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "erob/erob_types.h"
@@ -75,6 +76,7 @@ private:
     std::atomic<bool> quick_stop_latched_{false};
     std::atomic<uint64_t> next_sequence_{1};
 
+    mutable std::recursive_mutex runtime_mutex_;
     std::string last_error_;
 
     double planner_filtered_target_deg_ = 0.0;

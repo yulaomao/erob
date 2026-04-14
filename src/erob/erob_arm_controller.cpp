@@ -836,6 +836,7 @@ bool ErobArmController::quickStopAll() {
 }
 
 std::string ErobArmController::lastError() const {
+    std::lock_guard<std::mutex> lock(last_error_mutex_);
     return last_error_;
 }
 
@@ -1139,6 +1140,7 @@ std::string ErobArmController::discoveryCachePath() const {
 }
 
 void ErobArmController::setLastError(const std::string& message) {
+    std::lock_guard<std::mutex> lock(last_error_mutex_);
     last_error_ = message;
 }
 

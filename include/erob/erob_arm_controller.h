@@ -95,6 +95,7 @@ private:
     std::thread monitor_thread_;
     std::atomic<int> wkc_miss_count_{0};
     std::atomic<int> recovery_fail_count_{0};
+    mutable std::mutex last_error_mutex_;
     std::string last_error_;
 };
 

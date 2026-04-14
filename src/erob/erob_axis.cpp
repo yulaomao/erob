@@ -28,14 +28,17 @@ const AxisConfig& ErobAxis::config() const {
 }
 
 AxisState ErobAxis::getState() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return state_buffer_.load();
 }
 
 std::string ErobAxis::lastError() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return last_error_;
 }
 
 bool ErobAxis::enable() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     AxisCommand command = command_buffer_.load();
     command.enable_requested = true;
@@ -47,6 +50,7 @@ bool ErobAxis::enable() {
 }
 
 bool ErobAxis::disable() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
     follow_positive_limit_hold_ = false;
@@ -68,6 +72,7 @@ bool ErobAxis::disable() {
 }
 
 bool ErobAxis::resetFault() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     AxisCommand command = command_buffer_.load();
     command.reset_fault_requested = true;
@@ -77,6 +82,7 @@ bool ErobAxis::resetFault() {
 }
 
 bool ErobAxis::quickStop() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(true, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
     follow_positive_limit_hold_ = false;
@@ -105,6 +111,7 @@ bool ErobAxis::setProfilePositionTarget(
     double velocity_deg_s,
     ProfilePositionParams* params,
     uint64_t* request_id) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     if (params == nullptr) {
         setLastError("profile position params output is null");
         return false;
@@ -167,6 +174,7 @@ bool ErobAxis::setProfilePositionTarget(
 }
 
 bool ErobAxis::enterFollowMode(uint64_t* request_id) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     profile_transition_pending_ = false;
     profile_request_id_.store(
@@ -217,6 +225,7 @@ bool ErobAxis::enterFollowMode(uint64_t* request_id) {
 }
 
 bool ErobAxis::updateFollowTarget(double angle_deg) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     if (!follow_active_.load(std::memory_order_acquire)) {
         setLastError("follow mode is not active");
         return false;
@@ -235,7 +244,8 @@ bool ErobAxis::updateFollowTarget(double angle_deg) {
 }
 
 bool ErobAxis::stopFollowMode(uint64_t* request_id) {
-    const AxisState state = getState();
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+    const AxisState state = state_buffer_.load();
     const AxisCommand current_command = command_buffer_.load();
     const bool already_stopped =
         !follow_active_.load(std::memory_order_acquire) &&
@@ -278,6 +288,7 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
 }
 
 void ErobAxis::planFollowStep() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     const bool follow_active = follow_active_.load(std::memory_order_acquire);
     if (!follow_active) {
         return;
@@ -409,6 +420,7 @@ void ErobAxis::planFollowStep() {
 }
 
 void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
     state.statusword = txpdo.statusword;
@@ -492,12 +504,14 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
 }
 
 void ErobAxis::updateLastErrorCode(int error_code) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisState state = state_buffer_.load();
     state.last_error_code = error_code;
     state_buffer_.publish(state);
 }
 
 void ErobAxis::markProfilePositionTimeout() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisState state = state_buffer_.load();
     state.position_mode_state = PositionModeState::kTimeout;
     state.target_reached = false;
@@ -505,6 +519,7 @@ void ErobAxis::markProfilePositionTimeout() {
 }
 
 RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     const AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
     const bool control_transition_requested =
@@ -577,22 +592,27 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
 }
 
 bool ErobAxis::isNearPositiveLimit() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return state_buffer_.load().near_positive_limit;
 }
 
 bool ErobAxis::isNearNegativeLimit() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return state_buffer_.load().near_negative_limit;
 }
 
 bool ErobAxis::isFollowActive() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return follow_active_.load(std::memory_order_acquire);
 }
 
 uint64_t ErobAxis::profileRequestId() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return profile_request_id_.load(std::memory_order_acquire);
 }
 
 uint64_t ErobAxis::followRequestId() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return follow_request_id_.load(std::memory_order_acquire);
 }
 
@@ -605,6 +625,7 @@ bool ErobAxis::hasBoundMotor() const {
 }
 
 bool ErobAxis::publishCommand(const AxisCommand& command) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisCommand latched_command = command;
     if (quick_stop_latched_.load(std::memory_order_acquire)) {
         latched_command.quick_stop_requested = true;
@@ -718,16 +739,19 @@ double ErobAxis::applyVelocityLimiter(const AxisState& state, double velocity_de
 }
 
 void ErobAxis::setLastError(const std::string& message) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     last_error_ = message;
 }
 
 void ErobAxis::setPositionModeState(PositionModeState state) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisState axis_state = state_buffer_.load();
     axis_state.position_mode_state = state;
     state_buffer_.publish(axis_state);
 }
 
 void ErobAxis::setFollowModeState(FollowModeState state) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisState axis_state = state_buffer_.load();
     axis_state.follow_mode_state = state;
     state_buffer_.publish(axis_state);

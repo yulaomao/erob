@@ -129,6 +129,7 @@ std::vector<MotorIdentity> EthercatMasterSession::scanMotorsOnAllAdapters() {
 }
 
 bool EthercatMasterSession::connect(const std::string& adapter_name) {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     disconnect();
     if (adapter_name.empty()) {
         setLastError("adapter name is empty");
@@ -145,6 +146,7 @@ bool EthercatMasterSession::connect(const std::string& adapter_name) {
 }
 
 void EthercatMasterSession::disconnect() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (connected_) {
         ec_slave[0].state = EC_STATE_INIT;
         ec_writestate(0);
@@ -159,6 +161,7 @@ void EthercatMasterSession::disconnect() {
 }
 
 bool EthercatMasterSession::discoverMotors(std::vector<MotorIdentity>* motors) {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         setLastError("EtherCAT master is not connected");
         return false;
@@ -184,6 +187,7 @@ bool EthercatMasterSession::discoverMotors(std::vector<MotorIdentity>* motors) {
 }
 
 bool EthercatMasterSession::configurePdos() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!ensurePreOperational()) {
         return false;
     }
@@ -204,6 +208,7 @@ bool EthercatMasterSession::configurePdos() {
 }
 
 bool EthercatMasterSession::requestSafeOperational() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         setLastError("EtherCAT master is not connected");
         return false;
@@ -228,6 +233,7 @@ bool EthercatMasterSession::requestSafeOperational() {
 }
 
 bool EthercatMasterSession::configureDistributedClocks(int64_t cycle_ns) {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         setLastError("EtherCAT master is not connected");
         return false;
@@ -250,6 +256,7 @@ bool EthercatMasterSession::configureDistributedClocks(int64_t cycle_ns) {
 }
 
 bool EthercatMasterSession::requestOperational() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         setLastError("EtherCAT master is not connected");
         return false;
@@ -287,6 +294,7 @@ bool EthercatMasterSession::requestOperational() {
 }
 
 bool EthercatMasterSession::sendProcessData() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!operational_) {
         return false;
     }
@@ -295,6 +303,7 @@ bool EthercatMasterSession::sendProcessData() {
 }
 
 int EthercatMasterSession::receiveProcessData(int timeout_us) {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!operational_) {
         return 0;
     }
@@ -303,6 +312,7 @@ int EthercatMasterSession::receiveProcessData(int timeout_us) {
 }
 
 bool EthercatMasterSession::readAxisFeedback(uint16_t slave_index, TxPdoCommon* txpdo) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!operational_ || txpdo == nullptr || slave_index == 0 || slave_index > ec_slavecount) {
         return false;
     }
@@ -314,6 +324,7 @@ bool EthercatMasterSession::readAxisFeedback(uint16_t slave_index, TxPdoCommon* 
 }
 
 bool EthercatMasterSession::writeAxisCommand(uint16_t slave_index, const RxPdoUnified& rxpdo) {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_ || slave_index == 0 || slave_index > ec_slavecount) {
         return false;
     }
@@ -325,34 +336,42 @@ bool EthercatMasterSession::writeAxisCommand(uint16_t slave_index, const RxPdoUn
 }
 
 bool EthercatMasterSession::sdoWriteU8(uint16_t slave, uint16_t index, uint8_t subindex, uint8_t value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoWrite(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::sdoWriteU16(uint16_t slave, uint16_t index, uint8_t subindex, uint16_t value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoWrite(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::sdoWriteU32(uint16_t slave, uint16_t index, uint8_t subindex, uint32_t value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoWrite(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::sdoWriteI32(uint16_t slave, uint16_t index, uint8_t subindex, int32_t value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoWrite(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::sdoReadU16(uint16_t slave, uint16_t index, uint8_t subindex, uint16_t* value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoRead(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::sdoReadU32(uint16_t slave, uint16_t index, uint8_t subindex, uint32_t* value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoRead(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::sdoReadU8(uint16_t slave, uint16_t index, uint8_t subindex, uint8_t* value) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return SdoRead(slave, index, subindex, value);
 }
 
 bool EthercatMasterSession::recoverSlaves() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         return false;
     }
@@ -400,19 +419,27 @@ bool EthercatMasterSession::recoverSlaves() {
     return recovered_any;
 }
 
+std::recursive_mutex& EthercatMasterSession::busMutex() {
+    return bus_mutex_;
+}
+
 int EthercatMasterSession::slaveCount() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return connected_ ? ec_slavecount : 0;
 }
 
 int EthercatMasterSession::expectedWkc() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return expected_wkc_;
 }
 
 int EthercatMasterSession::lastWkc() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return last_wkc_;
 }
 
 int EthercatMasterSession::slaveAlStatusCode(uint16_t slave_index) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_ || slave_index == 0 || slave_index > ec_slavecount) {
         return 0;
     }
@@ -420,14 +447,17 @@ int EthercatMasterSession::slaveAlStatusCode(uint16_t slave_index) const {
 }
 
 bool EthercatMasterSession::isConnected() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return connected_;
 }
 
 bool EthercatMasterSession::isOperational() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return operational_;
 }
 
 bool EthercatMasterSession::allSlavesOperational() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         return false;
     }
@@ -444,10 +474,12 @@ const std::string& EthercatMasterSession::adapterName() const {
 }
 
 std::string EthercatMasterSession::lastError() const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     return last_error_;
 }
 
 MotorIdentity EthercatMasterSession::motorIdentity(uint16_t slave_index) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     MotorIdentity identity;
     if (!connected_ || slave_index == 0 || slave_index > ec_slavecount) {
         return identity;
@@ -467,6 +499,7 @@ MotorIdentity EthercatMasterSession::motorIdentity(uint16_t slave_index) const {
 }
 
 bool EthercatMasterSession::ensurePreOperational() {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (!connected_) {
         setLastError("EtherCAT master is not connected");
         return false;
@@ -482,6 +515,7 @@ bool EthercatMasterSession::ensurePreOperational() {
 }
 
 bool EthercatMasterSession::mapRxPdo(uint16_t slave) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     const uint8_t zero_map = 0;
     if (!sdoWriteU8(slave, 0x1600, 0x00, zero_map)) {
         return false;
@@ -509,6 +543,7 @@ bool EthercatMasterSession::mapRxPdo(uint16_t slave) const {
 }
 
 bool EthercatMasterSession::mapTxPdo(uint16_t slave) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     const uint8_t zero_map = 0;
     if (!sdoWriteU8(slave, 0x1A00, 0x00, zero_map)) {
         return false;
@@ -538,6 +573,7 @@ bool EthercatMasterSession::mapTxPdo(uint16_t slave) const {
 }
 
 bool EthercatMasterSession::readSerialNumber(uint16_t slave, std::string* serial_number) const {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     if (serial_number == nullptr) {
         return false;
     }
@@ -558,6 +594,7 @@ bool EthercatMasterSession::isLikelyErobMotor(const ec_slavet& slave) const {
 }
 
 void EthercatMasterSession::setLastError(const std::string& message) {
+    std::lock_guard<std::recursive_mutex> lock(bus_mutex_);
     last_error_ = message;
 }
 

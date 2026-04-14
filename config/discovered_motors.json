@@ -1,16 +1,5 @@
 {
-  "last_adapter": "enp2s0",
+  "last_adapter": "",
   "motors": [
-    {
-      "serial_number": "",
-      "adapter_name": "enp2s0",
-      "slave_index": 1,
-      "alias": 0,
-      "eep_man": 1516597871,
-      "eep_id": 168530,
-      "eep_rev": 1,
-      "name": "ZeroErr Driver",
-      "is_erob_motor": false
-    }
   ]
 }

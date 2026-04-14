@@ -2,6 +2,7 @@
 #define ETHERCAT_MASTER_SESSION_H_
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,7 @@ public:
     bool sdoReadU8(uint16_t slave, uint16_t index, uint8_t subindex, uint8_t* value) const;
 
     bool recoverSlaves();
+    std::recursive_mutex& busMutex();
 
     int slaveCount() const;
     int expectedWkc() const;
@@ -69,6 +71,7 @@ private:
     int last_wkc_ = 0;
     bool connected_ = false;
     bool operational_ = false;
+    mutable std::recursive_mutex bus_mutex_;
 };
 
 }  // namespace erob
