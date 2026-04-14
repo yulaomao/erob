@@ -29,6 +29,7 @@ public:
         double velocity_deg_s,
         ProfilePositionParams* params,
         uint64_t* request_id = nullptr);
+    bool retriggerProfilePositionTarget(uint64_t request_id);
     bool enterFollowMode(uint64_t* request_id = nullptr);
     bool updateFollowTarget(double angle_deg);
     bool stopFollowMode(uint64_t* request_id = nullptr);

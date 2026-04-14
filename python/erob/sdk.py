@@ -250,26 +250,22 @@ class ErobController:
             self._require_bool(self._lib.erob_controller_quick_stop_all(self._handle), "quick_stop_all")
 
     def move_to(self, axis_id: int, angle_deg: float, velocity_deg_s: float) -> None:
-        with self._lock:
-            self._require_bool(
-                self._lib.erob_controller_move_to(self._handle, axis_id, angle_deg, velocity_deg_s),
-                "move_to",
-            )
+        self._require_bool(
+            self._lib.erob_controller_move_to(self._handle, axis_id, angle_deg, velocity_deg_s),
+            "move_to",
+        )
 
     def start_follow(self, axis_id: int) -> None:
-        with self._lock:
-            self._require_bool(self._lib.erob_controller_start_follow(self._handle, axis_id), "start_follow")
+        self._require_bool(self._lib.erob_controller_start_follow(self._handle, axis_id), "start_follow")
 
     def update_follow_target(self, axis_id: int, angle_deg: float) -> None:
-        with self._lock:
-            self._require_bool(
-                self._lib.erob_controller_update_follow_target(self._handle, axis_id, angle_deg),
-                "update_follow_target",
-            )
+        self._require_bool(
+            self._lib.erob_controller_update_follow_target(self._handle, axis_id, angle_deg),
+            "update_follow_target",
+        )
 
     def stop_follow(self, axis_id: int) -> None:
-        with self._lock:
-            self._require_bool(self._lib.erob_controller_stop_follow(self._handle, axis_id), "stop_follow")
+        self._require_bool(self._lib.erob_controller_stop_follow(self._handle, axis_id), "stop_follow")
 
     def set_preferred_adapter(self, adapter_name: str) -> None:
         with self._lock:

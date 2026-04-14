@@ -78,6 +78,7 @@ from .sdk import AxisMetadata, AxisState, ControllerError, ErobController
 
 
 FOLLOW_ACTIVE_STATES = {"EnteringCsvMode", "Following", "Stopping"}
+POSITION_MOVING_STATES = {"SendingSetpoint", "Moving", "Timeout"}
 
 
 class UiSignals(QObject):
@@ -108,7 +109,7 @@ class MainWindow(QMainWindow):
         self._follow_active_axes: set[int] = set()
         self._dial_scale = 10
         self._pending_follow_target = 0.0
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor = ThreadPoolExecutor(max_workers=4)
         self.signals = UiSignals()
         self.signals.command_finished.connect(self._handle_command_finished)
         self.binding_reports: dict[int, dict] = {}
@@ -732,6 +733,20 @@ class MainWindow(QMainWindow):
         axis_ids = self.selected_axis_ids()
         if not axis_ids:
             return
+        busy_axes = []
+        for axis_id in axis_ids:
+            if axis_id < len(self.axis_states):
+                state = self.axis_states[axis_id]
+                if (
+                    state.follow_mode_name in FOLLOW_ACTIVE_STATES
+                    and abs(state.actual_velocity_deg_s) > 0.5
+                ):
+                    busy_axes.append(f"axis {axis_id}")
+        if busy_axes:
+            message = "以下轴仍处于随动且速度未降下，不能执行 moveTo: " + ", ".join(busy_axes)
+            self._append_log(f"[move-selected] {message}")
+            QMessageBox.information(self, "随动未停止", message)
+            return
         angle = self.target_spin.value()
         velocity = self.velocity_spin.value()
         self.submit(
@@ -745,6 +760,21 @@ class MainWindow(QMainWindow):
     def _start_follow_selected(self) -> None:
         selected_axes = self.selected_axis_ids()
         if not selected_axes:
+            return
+        busy_axes = []
+        for axis_id in selected_axes:
+            if axis_id < len(self.axis_states):
+                state = self.axis_states[axis_id]
+                if (
+                    state.position_mode_name in POSITION_MOVING_STATES
+                    and not state.target_reached
+                    and abs(state.actual_velocity_deg_s) > 0.5
+                ):
+                    busy_axes.append(f"axis {axis_id}")
+        if busy_axes:
+            message = "以下轴仍在位置运动中，需到位或速度接近 0 后才能启动随动: " + ", ".join(busy_axes)
+            self._append_log(f"[start-follow-selected] {message}")
+            QMessageBox.information(self, "位置运动未结束", message)
             return
         if self.axis_states:
             axis_id = selected_axes[0]

@@ -156,7 +156,7 @@ bool ErobAxis::setProfilePositionTarget(
     command.disable_requested = false;
     command.quick_stop_requested = false;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
-    profile_transition_pending_ = false;
+    profile_transition_pending_ = true;
     pending_profile_target_deg_ = clamped_angle;
     pending_profile_velocity_deg_s_ = limited_velocity;
     state.target_angle_deg = clamped_angle;
@@ -221,6 +221,26 @@ bool ErobAxis::enterFollowMode(uint64_t* request_id) {
     if (request_id != nullptr) {
         *request_id = new_request_id;
     }
+    return publishCommand(command);
+}
+
+bool ErobAxis::retriggerProfilePositionTarget(uint64_t request_id) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+    if (profile_request_id_.load(std::memory_order_acquire) != request_id) {
+        return false;
+    }
+
+    AxisCommand command = command_buffer_.load();
+    command.requested_mode = MotionMode::kProfilePosition;
+    command.target_angle_deg = pending_profile_target_deg_;
+    command.target_velocity_deg_s = pending_profile_velocity_deg_s_;
+    command.command_updated = true;
+    command.enable_requested = true;
+    command.disable_requested = false;
+    command.quick_stop_requested = false;
+    command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    profile_transition_pending_ = true;
+    setPositionModeState(PositionModeState::kSendingSetpoint);
     return publishCommand(command);
 }
 
@@ -522,6 +542,9 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     const AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
+    constexpr uint16_t kPpControlwordBase = 0x002FU;
+    constexpr uint16_t kPpControlwordNewSetpoint = 0x003FU;
+    constexpr int kPpPulseCycles = 2;
     const bool control_transition_requested =
         command.quick_stop_requested ||
         command.disable_requested ||
@@ -532,7 +555,8 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
         if (!control_transition_requested && command.requested_mode == MotionMode::kProfilePosition) {
             target_position_count_ = angleToCount(command.target_angle_deg);
             pp_control_toggle_ ^= 0x0040U;
-            pp_pulse_cycles_remaining_ = 1;
+            pp_pulse_cycles_remaining_ = 0;
+            profile_transition_pending_ = true;
             setPositionModeState(PositionModeState::kSendingSetpoint);
         } else if (!control_transition_requested && command.requested_mode == MotionMode::kCyclicSyncVelocity) {
             interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
@@ -544,6 +568,7 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
             }
         } else if (control_transition_requested) {
             pp_pulse_cycles_remaining_ = 0;
+            profile_transition_pending_ = false;
         }
         last_cycle_sequence_ = command.sequence;
     }
@@ -558,7 +583,7 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     if (!control_transition_requested &&
         command.requested_mode == MotionMode::kProfilePosition &&
         state.cia402_state == CiA402State::kOperationEnabled) {
-        pdo.controlword = static_cast<uint16_t>(0x000FU | pp_control_toggle_);
+        pdo.controlword = static_cast<uint16_t>(kPpControlwordBase | pp_control_toggle_);
     }
 
     if (command.requested_mode == MotionMode::kCyclicSyncVelocity) {
@@ -578,10 +603,15 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
 
     if (!control_transition_requested &&
         command.requested_mode == MotionMode::kProfilePosition &&
-        state.cia402_state == CiA402State::kOperationEnabled &&
-        pp_pulse_cycles_remaining_ > 0) {
-        pdo.controlword = static_cast<uint16_t>(0x001FU | pp_control_toggle_);
-        --pp_pulse_cycles_remaining_;
+        state.cia402_state == CiA402State::kOperationEnabled) {
+        if (profile_transition_pending_) {
+            pdo.controlword = static_cast<uint16_t>(kPpControlwordBase | pp_control_toggle_);
+            profile_transition_pending_ = false;
+            pp_pulse_cycles_remaining_ = kPpPulseCycles;
+        } else if (pp_pulse_cycles_remaining_ > 0) {
+            pdo.controlword = static_cast<uint16_t>(kPpControlwordNewSetpoint | pp_control_toggle_);
+            --pp_pulse_cycles_remaining_;
+        }
     }
 
     AxisState next_state = state;

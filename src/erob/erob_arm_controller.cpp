@@ -149,6 +149,30 @@ int EstimateProfilePositionTimeoutMs(
     return static_cast<int>(std::ceil(timeout_sec * 1000.0));
 }
 
+double ModeSwitchVelocityToleranceDegS(const AxisConfig& axis_config) {
+    return std::max(0.5, axis_config.max_velocity_deg_s * 0.02);
+}
+
+bool IsProfilePositionStillSettling(const AxisConfig& axis_config, const AxisState& state) {
+    const bool position_command_active =
+        state.position_mode_state == PositionModeState::kSendingSetpoint ||
+        state.position_mode_state == PositionModeState::kMoving ||
+        state.position_mode_state == PositionModeState::kTimeout;
+    if (!position_command_active) {
+        return false;
+    }
+    if (state.target_reached) {
+        return false;
+    }
+    return std::fabs(state.actual_velocity_deg_s) > ModeSwitchVelocityToleranceDegS(axis_config);
+}
+
+bool IsFollowModeBusy(const AxisState& state, const ErobAxis* axis_ptr) {
+    return axis_ptr->isFollowActive() ||
+        state.follow_mode_state != FollowModeState::kIdle ||
+        state.motion_mode == MotionMode::kCyclicSyncVelocity;
+}
+
 }  // namespace
 
 ErobArmController::ErobArmController(std::string config_path)
@@ -570,11 +594,34 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         setLastError("axis must be enabled before moveTo");
         return false;
     }
+    if (IsFollowModeBusy(state, target_axis)) {
+        if (std::fabs(state.actual_velocity_deg_s) > ModeSwitchVelocityToleranceDegS(target_axis->config())) {
+            setLastError("axis is in follow mode and still moving; wait until velocity is near zero before moveTo");
+            return false;
+        }
+        if (!stopFollowMode(axis_id)) {
+            if (lastError().empty()) {
+                setLastError("failed to stop follow mode before moveTo");
+            }
+            return false;
+        }
+    }
+
+    const AxisState ready_state = target_axis->getState();
+    if (!ready_state.online) {
+        setLastError("axis went offline before moveTo");
+        return false;
+    }
+    if (!ready_state.enabled) {
+        setLastError("axis must remain enabled before moveTo");
+        return false;
+    }
 
     ProfilePositionParams params;
     uint64_t request_id = 0;
     {
         std::lock_guard<std::mutex> lock(*axis_command_mutexes_[axis_id]);
+        std::lock_guard<std::mutex> bus_lock(master_.busMutex());
         if (!target_axis->setProfilePositionTarget(angle_deg, velocity_deg_s, &params, &request_id)) {
             setLastError(target_axis->lastError());
             return false;
@@ -595,16 +642,18 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
     const AxisConfig& axis_config = target_axis->config();
     const int timeout_ms = EstimateProfilePositionTimeoutMs(
         axis_config,
-        state,
+        ready_state,
         angle_deg,
         velocity_deg_s);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    const double initial_angle_deg = ready_state.actual_angle_deg;
+    bool retriggered = false;
 
     while (std::chrono::steady_clock::now() < deadline) {
         const AxisState current_state = target_axis->getState();
         if (target_axis->profileRequestId() != request_id) {
-            setLastError("moveTo was superseded by a newer position request");
-            return false;
+            return true;
         }
         if (!current_state.online) {
             setLastError("axis went offline during moveTo");
@@ -622,6 +671,18 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         }
         if (current_state.target_reached) {
             return true;
+        }
+        if (!retriggered && std::chrono::steady_clock::now() >= retry_deadline) {
+            const bool still_not_moving =
+                std::fabs(current_state.actual_angle_deg - initial_angle_deg) <= 0.1 &&
+                std::fabs(current_state.actual_velocity_deg_s) <= 0.5;
+            if (still_not_moving) {
+                retriggered = true;
+                if (!target_axis->retriggerProfilePositionTarget(request_id)) {
+                    setLastError("moveTo failed to retrigger profile position set-point");
+                    return false;
+                }
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -662,6 +723,10 @@ bool ErobArmController::startFollowMode(int axis_id) {
     }
     if (!state.enabled) {
         setLastError("axis must be enabled before follow mode");
+        return false;
+    }
+    if (IsProfilePositionStillSettling(target_axis->config(), state)) {
+        setLastError("axis is still moving in profile position mode; wait until target reached or velocity is near zero before follow mode");
         return false;
     }
     uint64_t request_id = 0;
@@ -1051,7 +1116,6 @@ bool ErobArmController::canRescan() const {
 bool ErobArmController::applyProfilePositionParams(
     uint16_t slave_index,
     const ProfilePositionParams& params) {
-    std::lock_guard<std::mutex> bus_lock(master_.busMutex());
     if (!master_.sdoWriteU32NoLock(slave_index, 0x6081, 0x00, params.profile_velocity) ||
         !master_.sdoWriteU32NoLock(slave_index, 0x6083, 0x00, params.profile_acceleration) ||
         !master_.sdoWriteU32NoLock(slave_index, 0x6084, 0x00, params.profile_deceleration)) {
