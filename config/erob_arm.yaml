@@ -2,6 +2,7 @@ system:
   preferred_adapter:
   ethercat_cycle_hz: 1000
   follow_control_hz: 60
+  follow_max_velocity_deg_s: 60.0
   fault_policy: all_stop
 
 axes:
@@ -23,7 +24,6 @@ axes:
       kp: 8.0
       kd: 0.15
       deadband_deg: 0.05
-      max_velocity_deg_s: 250.0
       max_accel_deg_s2: 600.0
       max_decel_deg_s2: 600.0
       target_filter_alpha: 0.4
@@ -48,7 +48,6 @@ axes:
       kp: 7.5
       kd: 0.18
       deadband_deg: 0.05
-      max_velocity_deg_s: 220.0
       max_accel_deg_s2: 550.0
       max_decel_deg_s2: 550.0
       target_filter_alpha: 0.4
@@ -73,7 +72,6 @@ axes:
       kp: 7.5
       kd: 0.18
       deadband_deg: 0.05
-      max_velocity_deg_s: 220.0
       max_accel_deg_s2: 550.0
       max_decel_deg_s2: 550.0
       target_filter_alpha: 0.4

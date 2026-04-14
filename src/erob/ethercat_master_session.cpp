@@ -5,6 +5,7 @@
 #include <cstring>
 #include <sstream>
 
+#include "ethercatprint.h"
 #include "ethercatconfig.h"
 
 namespace erob {
@@ -32,6 +33,43 @@ bool ProbeAdapter(const std::string& adapter_name, int* discovered_slave_count) 
     }
     probe.disconnect();
     return discovered;
+}
+
+const char* EthercatStateName(uint16_t state) {
+    switch (state & 0x0F) {
+    case EC_STATE_INIT:
+        return "INIT";
+    case EC_STATE_PRE_OP:
+        return "PRE_OP";
+    case EC_STATE_BOOT:
+        return "BOOT";
+    case EC_STATE_SAFE_OP:
+        return "SAFE_OP";
+    case EC_STATE_OPERATIONAL:
+        return "OPERATIONAL";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+std::string FormatSlaveDiagnostics() {
+    std::ostringstream stream;
+    for (int slave = 1; slave <= ec_slavecount; ++slave) {
+        if (slave != 1) {
+            stream << " ; ";
+        }
+        const uint16_t state = ec_slave[slave].state;
+        stream << "slave " << slave
+               << " (" << ec_slave[slave].name << ")"
+               << ": state=0x" << std::hex << state << std::dec
+               << " " << EthercatStateName(state);
+        if ((state & EC_STATE_ERROR) != 0) {
+            stream << "+ERROR";
+        }
+        stream << ", AL=0x" << std::hex << ec_slave[slave].ALstatuscode << std::dec
+               << " " << ec_ALstatuscode2string(ec_slave[slave].ALstatuscode);
+    }
+    return stream.str();
 }
 
 template <typename T>
@@ -157,7 +195,6 @@ bool EthercatMasterSession::configurePdos() {
             setLastError(message.str());
             return false;
         }
-        ec_dcsync0(slave, TRUE, 1000000, 0);
     }
 
     ecx_context.manualstatechange = 1;
@@ -171,10 +208,20 @@ bool EthercatMasterSession::requestSafeOperational() {
         setLastError("EtherCAT master is not connected");
         return false;
     }
+
+    ec_readstate();
+    for (int slave = 1; slave <= ec_slavecount; ++slave) {
+        if (ec_slave[slave].state == (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
+            ec_slave[slave].state = EC_STATE_SAFE_OP + EC_STATE_ACK;
+            ec_writestate(static_cast<uint16_t>(slave));
+        }
+    }
+
     ec_slave[0].state = EC_STATE_SAFE_OP;
     ec_writestate(0);
     if (ec_statecheck(0, EC_STATE_SAFE_OP, 5 * EC_TIMEOUTSTATE) != EC_STATE_SAFE_OP) {
-        setLastError("failed to switch slaves to SAFE_OP");
+        ec_readstate();
+        setLastError("failed to switch slaves to SAFE_OP | " + FormatSlaveDiagnostics());
         return false;
     }
     return true;
@@ -185,6 +232,14 @@ bool EthercatMasterSession::configureDistributedClocks(int64_t cycle_ns) {
         setLastError("EtherCAT master is not connected");
         return false;
     }
+
+    if (cycle_ns <= 0) {
+        for (int slave = 1; slave <= ec_slavecount; ++slave) {
+            ec_dcsync0(slave, FALSE, 0, 0);
+        }
+        return true;
+    }
+
     ec_configdc();
     for (int slave = 1; slave <= ec_slavecount; ++slave) {
         if (ec_slave[slave].hasdc) {
@@ -200,15 +255,33 @@ bool EthercatMasterSession::requestOperational() {
         return false;
     }
 
+    ec_slave[0].state = EC_STATE_OPERATIONAL;
     ec_send_processdata();
     last_wkc_ = ec_receive_processdata(EC_TIMEOUTRET);
-    ec_slave[0].state = EC_STATE_OPERATIONAL;
     ec_writestate(0);
-    if (ec_statecheck(0, EC_STATE_OPERATIONAL, 5 * EC_TIMEOUTSTATE) != EC_STATE_OPERATIONAL) {
-        setLastError("failed to switch slaves to OPERATIONAL");
+
+    int retries = 200;
+    while (retries-- > 0) {
+        ec_send_processdata();
+        last_wkc_ = ec_receive_processdata(EC_TIMEOUTRET);
+        if (ec_statecheck(0, EC_STATE_OPERATIONAL, 50000) == EC_STATE_OPERATIONAL) {
+            operational_ = true;
+            return true;
+        }
+    }
+
+    if (ec_slave[0].state != EC_STATE_OPERATIONAL) {
+        ec_readstate();
+        std::ostringstream stream;
+        stream << "failed to switch slaves to OPERATIONAL"
+               << " | expected_wkc=" << expected_wkc_
+               << ", last_wkc=" << last_wkc_
+               << " | " << FormatSlaveDiagnostics();
+        setLastError(stream.str());
         operational_ = false;
         return false;
     }
+
     operational_ = true;
     return true;
 }

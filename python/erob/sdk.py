@@ -199,6 +199,12 @@ class ErobController:
     def metadata(self) -> list[AxisMetadata]:
         return list(self._metadata)
 
+    def refresh_metadata(self) -> list[AxisMetadata]:
+        with self._lock:
+            self._metadata = self._read_metadata()
+            self._cached_states = []
+            return list(self._metadata)
+
     @property
     def library_path(self) -> Path:
         return self._library_path
@@ -307,7 +313,13 @@ class ErobController:
 
     def scan_motors(self) -> list[dict[str, Any]]:
         with self._lock:
-            return self._json_call(self._lib.erob_controller_scan_motors_json)
+            motors = self._json_call(self._lib.erob_controller_scan_motors_json)
+            self._metadata = self._read_metadata()
+            self._cached_states = []
+            return motors
+
+    def scan_devices(self) -> list[dict[str, Any]]:
+        return self.scan_motors()
 
     def rescan_current(self) -> list[dict[str, Any]]:
         with self._lock:

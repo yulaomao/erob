@@ -82,6 +82,7 @@ private:
     double pending_profile_velocity_deg_s_ = 0.0;
     uint64_t last_cycle_sequence_ = 0;
     int pp_pulse_cycles_remaining_ = 0;
+    uint16_t pp_control_toggle_ = 0;
     int32_t target_position_count_ = 0;
     double interp_start_velocity_deg_s_ = 0.0;
     double interp_target_velocity_deg_s_ = 0.0;

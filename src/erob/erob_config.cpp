@@ -294,7 +294,7 @@ bool ConfigManager::loadFromFile(const std::string& path, SystemConfig* config) 
         if (in_axes && trimmed.rfind("- ", 0) == 0) {
             ++axis_index;
             if (axis_index >= static_cast<int>(config->axes.size())) {
-                continue;
+                config->axes.push_back(DefaultAxisConfig(axis_index));
             }
             config->axes[axis_index].logical_axis_id = axis_index;
             in_follow = false;
@@ -322,6 +322,8 @@ bool ConfigManager::loadFromFile(const std::string& path, SystemConfig* config) 
                 config->ethercat_cycle_hz = std::stoi(value);
             } else if (key == "follow_control_hz") {
                 config->follow_control_hz = std::stoi(value);
+            } else if (key == "follow_max_velocity_deg_s") {
+                config->follow_max_velocity_deg_s = std::stod(value);
             } else if (key == "fault_policy") {
                 ParseFaultPolicy(value, &config->fault_policy);
             }
@@ -345,6 +347,11 @@ bool ConfigManager::loadFromFile(const std::string& path, SystemConfig* config) 
         }
     }
 
+    for (AxisConfig& axis : config->axes) {
+        axis.follow.control_rate_hz = static_cast<double>(config->follow_control_hz);
+        axis.follow.max_velocity_deg_s = config->follow_max_velocity_deg_s;
+    }
+
     return true;
 }
 
@@ -358,6 +365,7 @@ bool ConfigManager::saveToFile(const std::string& path, const SystemConfig& conf
     output << "  preferred_adapter: " << config.preferred_adapter << "\n";
     output << "  ethercat_cycle_hz: " << config.ethercat_cycle_hz << "\n";
     output << "  follow_control_hz: " << config.follow_control_hz << "\n";
+    output << "  follow_max_velocity_deg_s: " << config.follow_max_velocity_deg_s << "\n";
     output << "  fault_policy: " << FaultPolicyToString(config.fault_policy) << "\n\n";
     output << "axes:\n";
 
@@ -382,7 +390,6 @@ bool ConfigManager::saveToFile(const std::string& path, const SystemConfig& conf
         output << "      kp: " << axis.follow.kp << "\n";
         output << "      kd: " << axis.follow.kd << "\n";
         output << "      deadband_deg: " << axis.follow.deadband_deg << "\n";
-        output << "      max_velocity_deg_s: " << axis.follow.max_velocity_deg_s << "\n";
         output << "      max_accel_deg_s2: " << axis.follow.max_accel_deg_s2 << "\n";
         output << "      max_decel_deg_s2: " << axis.follow.max_decel_deg_s2 << "\n";
         output << "      target_filter_alpha: " << axis.follow.target_filter_alpha << "\n";

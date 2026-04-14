@@ -46,10 +46,11 @@ public:
     bool startFollowMode(int axis_id);
     bool updateFollowTarget(int axis_id, double angle_deg);
     bool stopFollowMode(int axis_id);
+    std::vector<MotorIdentity> scanAndBind();
 
     AxisState getAxisState(int axis_id) const;
-    std::array<AxisState, 3> getAllAxisStates() const;
-    std::array<AxisBindingReport, 3> getBindingReports() const;
+    std::vector<AxisState> getAllAxisStates() const;
+    std::vector<AxisBindingReport> getBindingReports() const;
     std::vector<MotorIdentity> discoveredMotors() const;
     bool isDegraded() const;
     const SystemConfig& config() const;
@@ -72,6 +73,7 @@ private:
     bool canRescan() const;
     bool applyProfilePositionParams(uint16_t slave_index, const ProfilePositionParams& params);
     bool autoBindDiscoveredMotors(const std::vector<MotorIdentity>& motors);
+    void rebuildAxesFromDiscoveredMotors(const std::vector<MotorIdentity>& motors);
     void auditBindingState(const std::vector<MotorIdentity>& motors);
     void syncAxisControlRates();
     std::string discoveryCachePath() const;
@@ -80,11 +82,11 @@ private:
     ConfigManager config_manager_;
     SystemConfig config_;
     std::string config_path_;
-    std::array<std::unique_ptr<ErobAxis>, 3> axes_;
-    std::array<std::mutex, 3> axis_command_mutexes_;
+    std::vector<std::unique_ptr<ErobAxis>> axes_;
+    std::vector<std::unique_ptr<std::mutex>> axis_command_mutexes_;
     EthercatMasterSession master_;
     std::vector<MotorIdentity> discovered_motors_;
-    std::array<AxisBindingReport, 3> binding_reports_{};
+    std::vector<AxisBindingReport> binding_reports_;
     std::atomic<bool> degraded_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> initialized_{false};

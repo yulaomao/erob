@@ -79,7 +79,7 @@ struct FollowParams {
     double kp = 8.0;
     double kd = 0.15;
     double deadband_deg = 0.05;
-    double max_velocity_deg_s = 300.0;
+    double max_velocity_deg_s = 60.0;
     double max_accel_deg_s2 = 800.0;
     double max_decel_deg_s2 = 800.0;
     double target_filter_alpha = 0.4;
@@ -107,8 +107,9 @@ struct SystemConfig {
     std::string preferred_adapter;
     int ethercat_cycle_hz = 1000;
     int follow_control_hz = 60;
+    double follow_max_velocity_deg_s = 60.0;
     FaultPolicy fault_policy = FaultPolicy::kAllStop;
-    std::array<AxisConfig, 3> axes;
+    std::vector<AxisConfig> axes;
 };
 
 struct AxisBindingReport {
@@ -207,44 +208,41 @@ private:
     std::atomic<uint32_t> front_index_{0};
 };
 
+inline AxisConfig DefaultAxisConfig(int logical_axis_id) {
+    AxisConfig axis;
+    axis.logical_axis_id = logical_axis_id;
+    axis.joint_name = "axis_" + std::to_string(logical_axis_id);
+
+    if (logical_axis_id == 0) {
+        axis.joint_name = "base";
+        axis.counts_per_degree = 1456.3;
+        axis.max_velocity_deg_s = 180.0;
+        axis.max_accel_deg_s2 = 300.0;
+        axis.max_decel_deg_s2 = 300.0;
+        axis.follow.max_accel_deg_s2 = 600.0;
+        axis.follow.max_decel_deg_s2 = 600.0;
+    } else {
+        axis.counts_per_degree = 1820.0;
+        axis.max_velocity_deg_s = 150.0;
+        axis.max_accel_deg_s2 = 240.0;
+        axis.max_decel_deg_s2 = 240.0;
+        axis.follow.kp = 7.5;
+        axis.follow.kd = 0.18;
+        axis.follow.max_accel_deg_s2 = 550.0;
+        axis.follow.max_decel_deg_s2 = 550.0;
+        if (logical_axis_id == 1) {
+            axis.joint_name = "shoulder";
+        } else if (logical_axis_id == 2) {
+            axis.joint_name = "elbow";
+        }
+    }
+
+    return axis;
+}
+
 inline SystemConfig DefaultSystemConfig() {
     SystemConfig config;
     config.preferred_adapter = "";
-
-    config.axes[0].logical_axis_id = 0;
-    config.axes[0].joint_name = "base";
-    config.axes[0].counts_per_degree = 1456.3;
-    config.axes[0].max_velocity_deg_s = 180.0;
-    config.axes[0].max_accel_deg_s2 = 300.0;
-    config.axes[0].max_decel_deg_s2 = 300.0;
-    config.axes[0].follow.max_velocity_deg_s = 250.0;
-    config.axes[0].follow.max_accel_deg_s2 = 600.0;
-    config.axes[0].follow.max_decel_deg_s2 = 600.0;
-
-    config.axes[1].logical_axis_id = 1;
-    config.axes[1].joint_name = "shoulder";
-    config.axes[1].counts_per_degree = 1820.0;
-    config.axes[1].max_velocity_deg_s = 150.0;
-    config.axes[1].max_accel_deg_s2 = 240.0;
-    config.axes[1].max_decel_deg_s2 = 240.0;
-    config.axes[1].follow.kp = 7.5;
-    config.axes[1].follow.kd = 0.18;
-    config.axes[1].follow.max_velocity_deg_s = 220.0;
-    config.axes[1].follow.max_accel_deg_s2 = 550.0;
-    config.axes[1].follow.max_decel_deg_s2 = 550.0;
-
-    config.axes[2].logical_axis_id = 2;
-    config.axes[2].joint_name = "elbow";
-    config.axes[2].counts_per_degree = 1820.0;
-    config.axes[2].max_velocity_deg_s = 150.0;
-    config.axes[2].max_accel_deg_s2 = 240.0;
-    config.axes[2].max_decel_deg_s2 = 240.0;
-    config.axes[2].follow.kp = 7.5;
-    config.axes[2].follow.kd = 0.18;
-    config.axes[2].follow.max_velocity_deg_s = 220.0;
-    config.axes[2].follow.max_accel_deg_s2 = 550.0;
-    config.axes[2].follow.max_decel_deg_s2 = 550.0;
-
     return config;
 }
 

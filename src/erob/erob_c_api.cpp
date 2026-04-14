@@ -132,7 +132,7 @@ std::string SerializeAdapters(const std::vector<erob::AdapterInfo>& adapters) {
     return stream.str();
 }
 
-std::string SerializeBindingReports(const std::array<erob::AxisBindingReport, 3>& reports) {
+std::string SerializeBindingReports(const std::vector<erob::AxisBindingReport>& reports) {
     std::ostringstream stream;
     stream << '[';
     for (std::size_t index = 0; index < reports.size(); ++index) {
@@ -344,7 +344,7 @@ const char* erob_controller_scan_adapters_json(ErobControllerHandle* handle) {
 
 const char* erob_controller_scan_motors_json(ErobControllerHandle* handle) {
     return GuardString(handle, [&]() {
-        return SerializeMotors(handle->controller.scanMotorsOnAllAdapters());
+        return SerializeMotors(handle->controller.scanAndBind());
     });
 }
 

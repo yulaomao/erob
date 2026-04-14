@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <pthread.h>
 #include <sched.h>
 #include <sstream>
@@ -144,7 +145,7 @@ int EstimateProfilePositionTimeoutMs(
         state,
         target_angle_deg,
         velocity_deg_s);
-    const double timeout_sec = Clamp(estimated_motion_sec * 2.0, 1.0, 300.0);
+    const double timeout_sec = Clamp(estimated_motion_sec * 3.0 + 0.5, 2.0, 300.0);
     return static_cast<int>(std::ceil(timeout_sec * 1000.0));
 }
 
@@ -178,13 +179,35 @@ bool ErobArmController::initialize() {
         setLastError(master_.lastError());
         return false;
     }
-    if (!master_.configureDistributedClocks(1000000000LL / std::max(1, config_.ethercat_cycle_hz))) {
+    const int64_t cycle_ns = 1000000000LL / std::max(1, config_.ethercat_cycle_hz);
+    if (!master_.configureDistributedClocks(cycle_ns)) {
         setLastError(master_.lastError());
         return false;
     }
     if (!master_.requestOperational()) {
-        setLastError(master_.lastError());
-        return false;
+        const std::string op_error = master_.lastError();
+        const bool sync_related =
+            op_error.find("Synchronization error") != std::string::npos ||
+            op_error.find("AL=0x1a") != std::string::npos ||
+            op_error.find("AL=0x30") != std::string::npos ||
+            op_error.find("DC ") != std::string::npos;
+        if (!sync_related) {
+            setLastError(op_error);
+            return false;
+        }
+
+        if (!master_.configureDistributedClocks(0)) {
+            setLastError(master_.lastError());
+            return false;
+        }
+        if (!master_.requestSafeOperational()) {
+            setLastError(master_.lastError());
+            return false;
+        }
+        if (!master_.requestOperational()) {
+            setLastError(master_.lastError() + " | retry_without_dc=failed");
+            return false;
+        }
     }
     if (!startThreads()) {
         return false;
@@ -225,6 +248,21 @@ std::vector<MotorIdentity> ErobArmController::scanMotorsOnAllAdapters() {
     return master_.scanMotorsOnAllAdapters();
 }
 
+std::vector<MotorIdentity> ErobArmController::scanAndBind() {
+    if (!canRescan()) {
+        setLastError("scan requires controller shutdown and all axes disabled");
+        return {};
+    }
+
+    discovered_motors_ = scanMotorsOnAllAdapters();
+    if (!discovered_motors_.empty()) {
+        config_.preferred_adapter = discovered_motors_.front().adapter_name;
+    }
+    config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
+    autoBindDiscoveredMotors(discovered_motors_);
+    return discovered_motors_;
+}
+
 std::vector<MotorIdentity> ErobArmController::rescan() {
     if (!config_.preferred_adapter.empty() || (master_.isConnected() && !master_.adapterName().empty())) {
         return rescanCurrentAdapter();
@@ -263,6 +301,7 @@ std::vector<MotorIdentity> ErobArmController::rescanCurrentAdapter() {
     discovered_motors_ = motors;
     config_.preferred_adapter = adapter_name;
     config_manager_.saveDiscoveryCache(discoveryCachePath(), adapter_name, discovered_motors_);
+    autoBindDiscoveredMotors(discovered_motors_);
     return discovered_motors_;
 }
 
@@ -279,6 +318,7 @@ std::vector<MotorIdentity> ErobArmController::rescanAllAdapters() {
         setLastError("no EtherCAT motors discovered during full rescan");
     }
     config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
+    autoBindDiscoveredMotors(discovered_motors_);
     return discovered_motors_;
 }
 
@@ -328,6 +368,10 @@ bool ErobArmController::bindAxis(int axis_id, const MotorIdentity& motor) {
     config_.axes[axis_id].bound_motor = motor;
     config_.axes[axis_id].logical_axis_id = axis_id;
     config_.axes[axis_id].follow.control_rate_hz = static_cast<double>(config_.follow_control_hz);
+    config_.axes[axis_id].follow.max_velocity_deg_s = config_.follow_max_velocity_deg_s;
+    if (axis_command_mutexes_[axis_id] == nullptr) {
+        axis_command_mutexes_[axis_id] = std::make_unique<std::mutex>();
+    }
     axes_[axis_id] = std::make_unique<ErobAxis>(config_.axes[axis_id]);
     const bool bound = axes_[axis_id]->bindMotor(motor);
     if (bound) {
@@ -351,9 +395,15 @@ bool ErobArmController::bindAxis(int axis_id, const MotorIdentity& motor) {
 bool ErobArmController::connectAndBind() {
     loadDiscoveryCache();
 
-    if (!config_.preferred_adapter.empty() && connect(config_.preferred_adapter)) {
-        config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
-        return true;
+    std::vector<std::string> failure_details;
+
+    if (!config_.preferred_adapter.empty()) {
+        if (connect(config_.preferred_adapter)) {
+            config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
+            return true;
+        }
+        failure_details.push_back(
+            "preferred adapter " + config_.preferred_adapter + ": " + lastError());
     }
 
     std::vector<AdapterInfo> adapters = scanAdapters();
@@ -367,9 +417,21 @@ bool ErobArmController::connectAndBind() {
             config_manager_.saveDiscoveryCache(discoveryCachePath(), adapter.name, discovered_motors_);
             return true;
         }
+        failure_details.push_back(adapter.name + ": " + lastError());
     }
 
-    setLastError("failed to connect to any adapter with EtherCAT slaves");
+    std::ostringstream stream;
+    stream << "failed to connect to any adapter with EtherCAT slaves";
+    if (!failure_details.empty()) {
+        stream << " | ";
+        for (std::size_t index = 0; index < failure_details.size(); ++index) {
+            if (index != 0) {
+                stream << " ; ";
+            }
+            stream << failure_details[index];
+        }
+    }
+    setLastError(stream.str());
     return false;
 }
 
@@ -512,7 +574,7 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
     ProfilePositionParams params;
     uint64_t request_id = 0;
     {
-        std::lock_guard<std::mutex> lock(axis_command_mutexes_[axis_id]);
+        std::lock_guard<std::mutex> lock(*axis_command_mutexes_[axis_id]);
         if (!target_axis->setProfilePositionTarget(angle_deg, velocity_deg_s, &params, &request_id)) {
             setLastError(target_axis->lastError());
             return false;
@@ -564,10 +626,21 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    const AxisState timed_out_state = target_axis->getState();
     target_axis->markProfilePositionTimeout();
     std::ostringstream stream;
-    stream << "moveTo timed out before target reached after " << timeout_ms
-           << " ms (dynamic profile estimate)";
+    stream << std::fixed << std::setprecision(2)
+           << "moveTo timed out before target reached after " << timeout_ms
+           << " ms (dynamic profile estimate)"
+           << " | actual_deg=" << timed_out_state.actual_angle_deg
+           << " | target_deg=" << timed_out_state.target_angle_deg
+           << " | error_deg=" << timed_out_state.position_error_deg
+           << " | velocity_deg_s=" << timed_out_state.actual_velocity_deg_s
+           << " | statusword=0x" << std::hex << timed_out_state.statusword << std::dec
+           << " | cia402=" << CiA402StateName(timed_out_state.cia402_state)
+           << " | mode=" << MotionModeName(timed_out_state.motion_mode)
+           << " | position_state=" << PositionModeStateName(timed_out_state.position_mode_state)
+           << " | target_reached=" << (timed_out_state.target_reached ? "true" : "false");
     setLastError(stream.str());
     return false;
 }
@@ -711,15 +784,15 @@ AxisState ErobArmController::getAxisState(int axis_id) const {
     return target_axis != nullptr ? target_axis->getState() : AxisState{};
 }
 
-std::array<AxisState, 3> ErobArmController::getAllAxisStates() const {
-    std::array<AxisState, 3> states{};
+std::vector<AxisState> ErobArmController::getAllAxisStates() const {
+    std::vector<AxisState> states(axes_.size());
     for (int axis_id = 0; axis_id < static_cast<int>(states.size()); ++axis_id) {
         states[axis_id] = getAxisState(axis_id);
     }
     return states;
 }
 
-std::array<AxisBindingReport, 3> ErobArmController::getBindingReports() const {
+std::vector<AxisBindingReport> ErobArmController::getBindingReports() const {
     return binding_reports_;
 }
 
@@ -965,38 +1038,7 @@ bool ErobArmController::applyProfilePositionParams(
 }
 
 bool ErobArmController::autoBindDiscoveredMotors(const std::vector<MotorIdentity>& motors) {
-    for (std::unique_ptr<ErobAxis>& axis_ptr : axes_) {
-        axis_ptr.reset();
-    }
-
-    std::vector<bool> motor_used(motors.size(), false);
-    for (int axis_id = 0; axis_id < static_cast<int>(config_.axes.size()); ++axis_id) {
-        const AxisConfig& axis_config = config_.axes[axis_id];
-        int matched_index = -1;
-
-        if (HasConfiguredMotorIdentity(axis_config)) {
-            for (std::size_t index = 0; index < motors.size(); ++index) {
-                if (!motor_used[index] && MatchesConfiguredIdentity(axis_config, motors[index])) {
-                    matched_index = static_cast<int>(index);
-                    break;
-                }
-            }
-        } else {
-            for (std::size_t index = 0; index < motors.size(); ++index) {
-                if (!motor_used[index] && motors[index].is_erob_motor) {
-                    matched_index = static_cast<int>(index);
-                    break;
-                }
-            }
-        }
-
-        if (matched_index < 0) {
-            continue;
-        }
-
-        motor_used[matched_index] = true;
-        bindAxis(axis_id, motors[matched_index]);
-    }
+    rebuildAxesFromDiscoveredMotors(motors);
 
     auditBindingState(motors);
 
@@ -1008,6 +1050,34 @@ bool ErobArmController::autoBindDiscoveredMotors(const std::vector<MotorIdentity
         setLastError("no axis could be bound to discovered motors");
     }
     return has_any_axis;
+}
+
+void ErobArmController::rebuildAxesFromDiscoveredMotors(const std::vector<MotorIdentity>& motors) {
+    const std::vector<AxisConfig> previous_axes = config_.axes;
+    config_.axes.clear();
+    axes_.clear();
+    axis_command_mutexes_.clear();
+    binding_reports_.clear();
+
+    for (int axis_id = 0; axis_id < static_cast<int>(motors.size()); ++axis_id) {
+        AxisConfig axis_config = axis_id < static_cast<int>(previous_axes.size())
+            ? previous_axes[axis_id]
+            : DefaultAxisConfig(axis_id);
+        axis_config.logical_axis_id = axis_id;
+        axis_config.follow.control_rate_hz = static_cast<double>(config_.follow_control_hz);
+        axis_config.follow.max_velocity_deg_s = config_.follow_max_velocity_deg_s;
+        axis_config.bound_motor = motors[axis_id];
+        if (axis_config.joint_name.empty()) {
+            axis_config.joint_name = "axis_" + std::to_string(axis_id);
+        }
+
+        config_.axes.push_back(axis_config);
+        axis_command_mutexes_.push_back(std::make_unique<std::mutex>());
+        auto axis_ptr = std::make_unique<ErobAxis>(axis_config);
+        axis_ptr->bindMotor(motors[axis_id]);
+        axes_.push_back(std::move(axis_ptr));
+        binding_reports_.push_back(AxisBindingReport{});
+    }
 }
 
 void ErobArmController::auditBindingState(const std::vector<MotorIdentity>& motors) {
@@ -1034,28 +1104,33 @@ void ErobArmController::auditBindingState(const std::vector<MotorIdentity>& moto
             report.detail = "configured motor " + ConfiguredIdentityText(axis_config) + " not found on current bus";
             degraded = true;
         } else {
-            bool any_candidate = false;
-            for (const MotorIdentity& motor : motors) {
-                if (motor.is_erob_motor) {
-                    any_candidate = true;
-                    break;
-                }
-            }
+            const bool any_candidate = !motors.empty();
             report.detail = any_candidate
                 ? "axis has no configured motor identity; left unbound"
-                : "no eRob motor discovered for this axis";
+                : "no motor discovered for this axis";
             degraded = true;
         }
 
-        binding_reports_[axis_id] = report;
+        if (axis_id >= static_cast<int>(binding_reports_.size())) {
+            binding_reports_.push_back(report);
+        } else {
+            binding_reports_[axis_id] = report;
+        }
     }
     degraded_.store(degraded, std::memory_order_release);
 }
 
 void ErobArmController::syncAxisControlRates() {
+    axes_.resize(config_.axes.size());
+    binding_reports_.resize(config_.axes.size());
+    axis_command_mutexes_.resize(config_.axes.size());
     for (int axis_id = 0; axis_id < static_cast<int>(config_.axes.size()); ++axis_id) {
         config_.axes[axis_id].logical_axis_id = axis_id;
         config_.axes[axis_id].follow.control_rate_hz = static_cast<double>(config_.follow_control_hz);
+        config_.axes[axis_id].follow.max_velocity_deg_s = config_.follow_max_velocity_deg_s;
+        if (axis_command_mutexes_[axis_id] == nullptr) {
+            axis_command_mutexes_[axis_id] = std::make_unique<std::mutex>();
+        }
     }
 }
 

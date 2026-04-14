@@ -127,25 +127,23 @@ bool ErobAxis::setProfilePositionTarget(
     interp_step_ = 0;
 
     command.requested_mode = MotionMode::kProfilePosition;
-    command.target_angle_deg = switching_from_follow ? state.actual_angle_deg : clamped_angle;
+    command.target_angle_deg = clamped_angle;
     command.target_velocity_deg_s = limited_velocity;
     command.command_updated = true;
     command.enable_requested = true;
     command.disable_requested = false;
     command.quick_stop_requested = false;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
-    profile_transition_pending_ = switching_from_follow;
+    profile_transition_pending_ = false;
     pending_profile_target_deg_ = clamped_angle;
     pending_profile_velocity_deg_s_ = limited_velocity;
-    state.target_angle_deg = switching_from_follow ? state.actual_angle_deg : clamped_angle;
-    state.position_error_deg = switching_from_follow ? 0.0 : (clamped_angle - state.actual_angle_deg);
+    state.target_angle_deg = clamped_angle;
+    state.position_error_deg = clamped_angle - state.actual_angle_deg;
     state.target_reached = false;
     state.position_mode_state = state.enabled
         ? PositionModeState::kSendingSetpoint
         : PositionModeState::kWaitingEnable;
-    state.follow_mode_state = switching_from_follow
-        ? FollowModeState::kStopping
-        : FollowModeState::kIdle;
+    state.follow_mode_state = FollowModeState::kIdle;
     state_buffer_.publish(state);
     if (request_id != nullptr) {
         *request_id = new_request_id;
@@ -278,44 +276,48 @@ void ErobAxis::planFollowStep() {
     }
 
     const double dt = 1.0 / std::max(1.0, config_.follow.control_rate_hz);
-    const int64_t now_ns = SteadyClockNowNs();
-    const int64_t last_target_ns = last_follow_target_ns_.load(std::memory_order_acquire);
 
     double desired_velocity = 0.0;
-    const bool watchdog_expired =
-        (now_ns - last_target_ns) > static_cast<int64_t>(config_.follow.watchdog_timeout_ms * 1e6);
-    if (watchdog_expired) {
-        const double decel = config_.follow.max_decel_deg_s2 * dt;
-        if (planner_velocity_deg_s_ > 0.0) {
-            desired_velocity = std::max(0.0, planner_velocity_deg_s_ - decel);
-        } else {
-            desired_velocity = std::min(0.0, planner_velocity_deg_s_ + decel);
-        }
-    } else {
-        const double raw_target = follow_target_deg_.load(std::memory_order_acquire);
-        planner_filtered_target_deg_ =
-            config_.follow.target_filter_alpha * raw_target +
-            (1.0 - config_.follow.target_filter_alpha) * planner_filtered_target_deg_;
+    const double raw_target = follow_target_deg_.load(std::memory_order_acquire);
+    const double clamped_target = clampAngle(raw_target);
+    planner_filtered_target_deg_ =
+        config_.follow.target_filter_alpha * clamped_target +
+        (1.0 - config_.follow.target_filter_alpha) * planner_filtered_target_deg_;
 
+    const double limit_settle_band_deg = std::max(0.2, config_.follow.deadband_deg * 4.0);
+    const bool saturated_to_positive_limit =
+        clamped_target >= (config_.max_angle_deg - 1e-6) &&
+        state.actual_angle_deg >= (config_.max_angle_deg - limit_settle_band_deg);
+    const bool saturated_to_negative_limit =
+        clamped_target <= (config_.min_angle_deg + 1e-6) &&
+        state.actual_angle_deg <= (config_.min_angle_deg + limit_settle_band_deg);
+
+    if (saturated_to_positive_limit || saturated_to_negative_limit) {
+        planner_filtered_target_deg_ = Clamp(
+            state.actual_angle_deg,
+            config_.min_angle_deg,
+            config_.max_angle_deg);
+        desired_velocity = 0.0;
+    } else {
         const double error = planner_filtered_target_deg_ - state.actual_angle_deg;
         if (std::fabs(error) > config_.follow.deadband_deg) {
             desired_velocity = config_.follow.kp * error - config_.follow.kd * state.actual_velocity_deg_s;
         }
+    }
 
-        desired_velocity = Clamp(
-            desired_velocity,
-            -config_.follow.max_velocity_deg_s,
-            config_.follow.max_velocity_deg_s);
+    desired_velocity = Clamp(
+        desired_velocity,
+        -config_.follow.max_velocity_deg_s,
+        config_.follow.max_velocity_deg_s);
 
-        const double max_accel = desired_velocity >= planner_velocity_deg_s_
-            ? config_.follow.max_accel_deg_s2
-            : config_.follow.max_decel_deg_s2;
-        const double accel_step = max_accel * dt;
-        if (desired_velocity > planner_velocity_deg_s_) {
-            desired_velocity = std::min(desired_velocity, planner_velocity_deg_s_ + accel_step);
-        } else {
-            desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
-        }
+    const double max_accel = desired_velocity >= planner_velocity_deg_s_
+        ? config_.follow.max_accel_deg_s2
+        : config_.follow.max_decel_deg_s2;
+    const double accel_step = max_accel * dt;
+    if (desired_velocity > planner_velocity_deg_s_) {
+        desired_velocity = std::min(desired_velocity, planner_velocity_deg_s_ + accel_step);
+    } else {
+        desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
     }
 
     planner_velocity_deg_s_ = desired_velocity;
@@ -330,8 +332,6 @@ void ErobAxis::planFollowStep() {
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
     if (state.motion_mode != MotionMode::kCyclicSyncVelocity) {
         setFollowModeState(FollowModeState::kEnteringCsvMode);
-    } else if (watchdog_expired) {
-        setFollowModeState(FollowModeState::kStopping);
     } else {
         setFollowModeState(FollowModeState::kFollowing);
     }
@@ -367,10 +367,14 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
             ? std::max(0.05, 20.0 / abs_counts_per_degree)
             : 0.05;
         const double velocity_tolerance_deg_s = std::max(0.5, config_.max_velocity_deg_s * 0.02);
-        const bool reached_bit = (txpdo.statusword & 0x0400U) != 0;
-        state.target_reached = reached_bit &&
-            std::fabs(state.position_error_deg) <= position_tolerance_deg &&
+        const bool within_position_tolerance =
+            std::fabs(state.position_error_deg) <= position_tolerance_deg;
+        const bool within_velocity_tolerance =
             std::fabs(state.actual_velocity_deg_s) <= velocity_tolerance_deg_s;
+        const bool reached_bit = (txpdo.statusword & 0x0400U) != 0;
+        const bool settled_at_target =
+            pp_pulse_cycles_remaining_ == 0 && within_position_tolerance && within_velocity_tolerance;
+        state.target_reached = (reached_bit && within_position_tolerance) || settled_at_target;
     } else {
         state.position_error_deg = state.target_angle_deg - state.actual_angle_deg;
         state.target_reached = false;
@@ -398,9 +402,6 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
     }
 
     const bool follow_active = follow_active_.load(std::memory_order_acquire);
-    const bool watchdog_expired = follow_active &&
-        ((SteadyClockNowNs() - last_follow_target_ns_.load(std::memory_order_acquire)) >
-            static_cast<int64_t>(config_.follow.watchdog_timeout_ms * 1e6));
     const double velocity_tolerance_deg_s = std::max(0.5, config_.max_velocity_deg_s * 0.02);
     if (state.fault || state.cia402_state == CiA402State::kQuickStopActive) {
         state.follow_mode_state = FollowModeState::kFault;
@@ -408,8 +409,6 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
         state.follow_mode_state = FollowModeState::kWaitingEnable;
     } else if (follow_active && state.motion_mode != MotionMode::kCyclicSyncVelocity) {
         state.follow_mode_state = FollowModeState::kEnteringCsvMode;
-    } else if (follow_active && watchdog_expired) {
-        state.follow_mode_state = FollowModeState::kStopping;
     } else if (follow_active) {
         state.follow_mode_state = FollowModeState::kFollowing;
     } else if (state.follow_mode_state == FollowModeState::kStopping &&
@@ -438,12 +437,12 @@ void ErobAxis::markProfilePositionTimeout() {
 RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     const AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
-    bool scheduled_pending_profile_target = false;
 
     if (command.sequence != last_cycle_sequence_) {
         if (command.requested_mode == MotionMode::kProfilePosition) {
             target_position_count_ = angleToCount(command.target_angle_deg);
-            pp_pulse_cycles_remaining_ = 2;
+            pp_control_toggle_ ^= 0x0040U;
+            pp_pulse_cycles_remaining_ = 1;
             setPositionModeState(PositionModeState::kSendingSetpoint);
         } else if (command.requested_mode == MotionMode::kCyclicSyncVelocity) {
             interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
@@ -464,6 +463,11 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     pdo.controlword = computeControlword(state, command);
     pdo.target_position = target_position_count_;
 
+    if (command.requested_mode == MotionMode::kProfilePosition &&
+        state.cia402_state == CiA402State::kOperationEnabled) {
+        pdo.controlword = static_cast<uint16_t>(0x000FU | pp_control_toggle_);
+    }
+
     if (command.requested_mode == MotionMode::kCyclicSyncVelocity) {
         if (interp_step_ < interp_steps_) {
             const double ratio = static_cast<double>(interp_step_) / static_cast<double>(interp_steps_);
@@ -482,29 +486,12 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     if (command.requested_mode == MotionMode::kProfilePosition &&
         state.cia402_state == CiA402State::kOperationEnabled &&
         pp_pulse_cycles_remaining_ > 0) {
-        pdo.controlword = 0x003F;
+        pdo.controlword = static_cast<uint16_t>(0x001FU | pp_control_toggle_);
         --pp_pulse_cycles_remaining_;
-        if (pp_pulse_cycles_remaining_ == 0 && profile_transition_pending_) {
-            AxisCommand next_command = command;
-            next_command.target_angle_deg = pending_profile_target_deg_;
-            next_command.target_velocity_deg_s = pending_profile_velocity_deg_s_;
-            next_command.command_updated = true;
-            next_command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
-            publishCommand(next_command);
-            profile_transition_pending_ = false;
-            scheduled_pending_profile_target = true;
-        }
     }
 
     AxisState next_state = state;
     next_state.controlword = pdo.controlword;
-    if (scheduled_pending_profile_target) {
-        next_state.target_angle_deg = pending_profile_target_deg_;
-        next_state.position_error_deg = pending_profile_target_deg_ - next_state.actual_angle_deg;
-        next_state.target_reached = false;
-        next_state.position_mode_state = PositionModeState::kSendingSetpoint;
-        next_state.follow_mode_state = FollowModeState::kIdle;
-    }
     state_buffer_.publish(next_state);
 
     return pdo;
