@@ -48,6 +48,7 @@ public:
 
 private:
     bool publishCommand(const AxisCommand& command);
+    bool shouldRejectFollowTarget(double angle_deg, const AxisState& state) const;
     double clampAngle(double angle_deg) const;
     int32_t angleToCount(double angle_deg) const;
     double countToAngle(int32_t count) const;
@@ -66,6 +67,7 @@ private:
     std::atomic<double> follow_target_deg_{0.0};
     std::atomic<int64_t> last_follow_target_ns_{0};
     std::atomic<bool> follow_active_{false};
+    std::atomic<bool> follow_first_update_pending_{false};
     std::atomic<uint64_t> profile_request_id_{0};
     std::atomic<uint64_t> next_profile_request_id_{1};
     std::atomic<uint64_t> follow_request_id_{0};

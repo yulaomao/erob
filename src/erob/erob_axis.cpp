@@ -8,6 +8,8 @@ namespace {
 
 constexpr double kFollowInputMinAngleDeg = -130.0;
 constexpr double kFollowInputMaxAngleDeg = 130.0;
+constexpr double kFollowFirstJumpLimitDeg = 40.0;
+constexpr double kFollowJumpLimitDeg = 20.0;
 
 }  // namespace
 
@@ -188,6 +190,7 @@ bool ErobAxis::enterFollowMode(uint64_t* request_id) {
     const uint64_t new_request_id = next_follow_request_id_.fetch_add(1, std::memory_order_relaxed);
     follow_request_id_.store(new_request_id, std::memory_order_release);
     follow_active_.store(true, std::memory_order_release);
+    follow_first_update_pending_.store(true, std::memory_order_release);
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
     last_follow_target_ns_.store(SteadyClockNowNs(), std::memory_order_release);
@@ -221,8 +224,13 @@ bool ErobAxis::updateFollowTarget(double angle_deg) {
     if (angle_deg < kFollowInputMinAngleDeg || angle_deg > kFollowInputMaxAngleDeg) {
         return true;
     }
+    const AxisState state = state_buffer_.load();
+    if (shouldRejectFollowTarget(angle_deg, state)) {
+        return true;
+    }
     follow_target_deg_.store(clampAngle(angle_deg), std::memory_order_release);
     last_follow_target_ns_.store(SteadyClockNowNs(), std::memory_order_release);
+    follow_first_update_pending_.store(false, std::memory_order_release);
     return true;
 }
 
@@ -607,6 +615,13 @@ bool ErobAxis::publishCommand(const AxisCommand& command) {
     }
     command_buffer_.publish(latched_command);
     return true;
+}
+
+bool ErobAxis::shouldRejectFollowTarget(double angle_deg, const AxisState& state) const {
+    const double jump_limit_deg = follow_first_update_pending_.load(std::memory_order_acquire)
+        ? kFollowFirstJumpLimitDeg
+        : kFollowJumpLimitDeg;
+    return std::fabs(angle_deg - state.actual_angle_deg) > jump_limit_deg;
 }
 
 double ErobAxis::clampAngle(double angle_deg) const {
