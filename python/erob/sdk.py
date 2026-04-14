@@ -221,6 +221,13 @@ class ErobController:
         with self._lock:
             self._require_bool(self._lib.erob_controller_shutdown(self._handle), "shutdown")
 
+    def recover_bus_and_rescan(self) -> list[dict[str, Any]]:
+        with self._lock:
+            motors = self._json_call(self._lib.erob_controller_recover_bus_and_rescan_json)
+            self._metadata = self._read_metadata()
+            self._cached_states = []
+            return motors
+
     def enable_axis(self, axis_id: int) -> None:
         with self._lock:
             self._require_bool(self._lib.erob_controller_enable_axis(self._handle, axis_id), "enable_axis")
@@ -416,6 +423,7 @@ class ErobController:
 
         string_calls = [
             "erob_controller_last_error",
+            "erob_controller_recover_bus_and_rescan_json",
             "erob_controller_scan_adapters_json",
             "erob_controller_scan_motors_json",
             "erob_controller_rescan_current_json",

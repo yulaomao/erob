@@ -197,6 +197,21 @@ void LogControllerDebug(int axis_id, const std::string& message) {
               << " | " << message << std::endl;
 }
 
+std::string JoinMessages(const std::vector<std::string>& messages) {
+    std::ostringstream stream;
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        if (index != 0) {
+            stream << " ; ";
+        }
+        stream << messages[index];
+    }
+    return stream.str();
+}
+
+std::string DisplayAdapterName(const std::string& adapter_name) {
+    return adapter_name.empty() ? std::string("-") : adapter_name;
+}
+
 }  // namespace
 
 ErobArmController::ErobArmController(std::string config_path)
@@ -216,52 +231,40 @@ bool ErobArmController::initialize() {
     }
     loadDiscoveryCache();
 
-    if (!connectAndBind()) {
-        return false;
-    }
-    if (!master_.configurePdos()) {
-        setLastError(master_.lastError());
-        return false;
-    }
-    if (!master_.requestSafeOperational()) {
-        setLastError(master_.lastError());
-        return false;
-    }
-    const int64_t cycle_ns = 1000000000LL / std::max(1, config_.ethercat_cycle_hz);
-    if (!master_.configureDistributedClocks(cycle_ns)) {
-        setLastError(master_.lastError());
-        return false;
-    }
-    if (!master_.requestOperational()) {
-        const std::string op_error = master_.lastError();
-        const bool sync_related = IsSyncRelatedOperationalFailure(op_error);
-        if (!sync_related) {
-            setLastError(op_error);
-            return false;
-        }
+    LogControllerDebug(
+        -1,
+        "initialize begin | preferred_adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | cached_motors=" + std::to_string(discovered_motors_.size()));
 
-        LogControllerDebug(-1, "initialize OP retry without DC after: " + op_error);
-
-        if (!master_.configureDistributedClocks(0)) {
-            setLastError(master_.lastError());
-            return false;
-        }
-        if (!master_.requestSafeOperational()) {
-            setLastError(master_.lastError());
-            return false;
-        }
-        if (!master_.requestOperational()) {
-            setLastError(master_.lastError() + " | retry_without_dc=failed");
-            return false;
-        }
-
-        LogControllerDebug(-1, "initialize OP retry without DC succeeded");
+    if (initializeNoRecovery()) {
+        LogControllerDebug(
+            -1,
+            "initialize success | adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+                " | discovered_motors=" + std::to_string(discovered_motors_.size()));
+        return true;
     }
-    if (!startThreads()) {
+
+    const std::string first_error = lastError();
+    LogControllerDebug(-1, "initialize primary attempt failed | error=" + first_error);
+
+    std::string recovery_summary;
+    if (!recoverBusAndRescanImpl(&recovery_summary)) {
+        const std::string recovery_error = lastError();
+        setLastError(first_error + " | recovery_rescan_failed=" + recovery_error);
         return false;
     }
 
-    initialized_.store(true, std::memory_order_release);
+    LogControllerDebug(-1, "initialize retry after bus recovery/rescan | " + recovery_summary);
+    if (!initializeNoRecovery()) {
+        const std::string retry_error = lastError();
+        setLastError(first_error + " | recovery_rescan_succeeded | retry_failed=" + retry_error);
+        return false;
+    }
+
+    LogControllerDebug(
+        -1,
+        "initialize success after bus recovery/rescan | adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size()));
     return true;
 }
 
@@ -269,6 +272,80 @@ bool ErobArmController::shutdown() {
     stopThreads();
     master_.disconnect();
     initialized_.store(false, std::memory_order_release);
+    return true;
+}
+
+bool ErobArmController::recoverBusAndRescan() {
+    return recoverBusAndRescanImpl(nullptr);
+}
+
+bool ErobArmController::initializeNoRecovery() {
+    LogControllerDebug(-1, "initialize step=connect_and_bind begin");
+    if (!connectAndBind()) {
+        const std::string error = lastError();
+        setLastError("initialize step=connect_and_bind failed | " + error);
+        return false;
+    }
+    LogControllerDebug(
+        -1,
+        "initialize step=connect_and_bind success | adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size()));
+
+    LogControllerDebug(-1, "initialize step=configure_pdos begin");
+    if (!master_.configurePdos()) {
+        setLastError("initialize step=configure_pdos failed | " + master_.lastError());
+        return false;
+    }
+
+    LogControllerDebug(-1, "initialize step=request_safe_operational begin");
+    if (!master_.requestSafeOperational()) {
+        setLastError("initialize step=request_safe_operational failed | " + master_.lastError());
+        return false;
+    }
+
+    const int64_t cycle_ns = 1000000000LL / std::max(1, config_.ethercat_cycle_hz);
+    LogControllerDebug(
+        -1,
+        "initialize step=configure_distributed_clocks begin | cycle_ns=" + std::to_string(cycle_ns));
+    if (!master_.configureDistributedClocks(cycle_ns)) {
+        setLastError("initialize step=configure_distributed_clocks failed | " + master_.lastError());
+        return false;
+    }
+
+    LogControllerDebug(-1, "initialize step=request_operational begin");
+    if (!master_.requestOperational()) {
+        const std::string op_error = master_.lastError();
+        const bool sync_related = IsSyncRelatedOperationalFailure(op_error);
+        if (!sync_related) {
+            setLastError("initialize step=request_operational failed | " + op_error);
+            return false;
+        }
+
+        LogControllerDebug(-1, "initialize OP retry without DC after: " + op_error);
+
+        if (!master_.configureDistributedClocks(0)) {
+            setLastError("initialize step=configure_distributed_clocks_retry_without_dc failed | " + master_.lastError());
+            return false;
+        }
+        if (!master_.requestSafeOperational()) {
+            setLastError("initialize step=request_safe_operational_retry_without_dc failed | " + master_.lastError());
+            return false;
+        }
+        if (!master_.requestOperational()) {
+            setLastError(
+                "initialize step=request_operational_retry_without_dc failed | " +
+                master_.lastError() + " | retry_without_dc=failed");
+            return false;
+        }
+
+        LogControllerDebug(-1, "initialize OP retry without DC succeeded");
+    }
+    if (!startThreads()) {
+        setLastError("initialize step=start_threads failed");
+        return false;
+    }
+
+    initialized_.store(true, std::memory_order_release);
     return true;
 }
 
@@ -302,12 +379,17 @@ std::vector<MotorIdentity> ErobArmController::scanAndBind() {
         return {};
     }
 
+    LogControllerDebug(-1, "scanAndBind begin | mode=all_adapters");
     discovered_motors_ = scanMotorsOnAllAdapters();
     if (!discovered_motors_.empty()) {
         config_.preferred_adapter = discovered_motors_.front().adapter_name;
     }
     config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
     autoBindDiscoveredMotors(discovered_motors_);
+    LogControllerDebug(
+        -1,
+        "scanAndBind complete | adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size()));
     return discovered_motors_;
 }
 
@@ -332,20 +414,13 @@ std::vector<MotorIdentity> ErobArmController::rescanCurrentAdapter() {
         return {};
     }
 
-    EthercatMasterSession scanner;
-    if (!scanner.connect(adapter_name)) {
-        setLastError(scanner.lastError());
-        return {};
-    }
-
     std::vector<MotorIdentity> motors;
-    if (!scanner.discoverMotors(&motors)) {
-        setLastError(scanner.lastError());
-        scanner.disconnect();
+    std::string detail;
+    if (!discoverMotorsOnAdapter(adapter_name, &motors, &detail)) {
+        setLastError(detail);
         return {};
     }
 
-    scanner.disconnect();
     discovered_motors_ = motors;
     config_.preferred_adapter = adapter_name;
     config_manager_.saveDiscoveryCache(discoveryCachePath(), adapter_name, discovered_motors_);
@@ -358,6 +433,7 @@ std::vector<MotorIdentity> ErobArmController::rescanAllAdapters() {
         setLastError("rescan requires controller shutdown and all axes disabled");
         return {};
     }
+    LogControllerDebug(-1, "rescanAllAdapters begin");
     discovered_motors_ = scanMotorsOnAllAdapters();
     if (!discovered_motors_.empty()) {
         config_.preferred_adapter = discovered_motors_.front().adapter_name;
@@ -367,10 +443,15 @@ std::vector<MotorIdentity> ErobArmController::rescanAllAdapters() {
     }
     config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
     autoBindDiscoveredMotors(discovered_motors_);
+    LogControllerDebug(
+        -1,
+        "rescanAllAdapters complete | adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size()));
     return discovered_motors_;
 }
 
 bool ErobArmController::connect(const std::string& adapter_name) {
+    LogControllerDebug(-1, "connect begin | adapter=" + DisplayAdapterName(adapter_name));
     if (!master_.connect(adapter_name)) {
         setLastError(master_.lastError());
         return false;
@@ -385,6 +466,10 @@ bool ErobArmController::connect(const std::string& adapter_name) {
 
     discovered_motors_ = motors;
     config_.preferred_adapter = adapter_name;
+    LogControllerDebug(
+        -1,
+        "connect discover success | adapter=" + DisplayAdapterName(adapter_name) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size()));
     return autoBindDiscoveredMotors(discovered_motors_);
 }
 
@@ -446,14 +531,23 @@ bool ErobArmController::connectAndBind() {
     std::vector<std::string> failure_details;
 
     if (!config_.preferred_adapter.empty()) {
+        LogControllerDebug(
+            -1,
+            "connectAndBind preferred adapter attempt | adapter=" + DisplayAdapterName(config_.preferred_adapter));
         if (connect(config_.preferred_adapter)) {
             config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
+            LogControllerDebug(
+                -1,
+                "connectAndBind preferred adapter success | adapter=" +
+                    DisplayAdapterName(config_.preferred_adapter) +
+                    " | discovered_motors=" + std::to_string(discovered_motors_.size()));
             return true;
         }
         failure_details.push_back(
             "preferred adapter " + config_.preferred_adapter + ": " + lastError());
     }
 
+    LogControllerDebug(-1, "connectAndBind fallback scanAdapters begin");
     std::vector<AdapterInfo> adapters = scanAdapters();
     if (adapters.empty()) {
         setLastError("no adapters found");
@@ -461,8 +555,17 @@ bool ErobArmController::connectAndBind() {
     }
 
     for (const AdapterInfo& adapter : adapters) {
+        LogControllerDebug(
+            -1,
+            "connectAndBind adapter attempt | adapter=" + DisplayAdapterName(adapter.name) +
+                " | probe_scan_success=" + (adapter.scan_success ? std::string("true") : std::string("false")) +
+                " | probe_discovered_slave_count=" + std::to_string(adapter.discovered_slave_count));
         if (connect(adapter.name)) {
             config_manager_.saveDiscoveryCache(discoveryCachePath(), adapter.name, discovered_motors_);
+            LogControllerDebug(
+                -1,
+                "connectAndBind adapter success | adapter=" + DisplayAdapterName(adapter.name) +
+                    " | discovered_motors=" + std::to_string(discovered_motors_.size()));
             return true;
         }
         failure_details.push_back(adapter.name + ": " + lastError());
@@ -530,6 +633,7 @@ bool ErobArmController::enableAxis(int axis_id) {
     while (std::chrono::steady_clock::now() < enable_deadline) {
         state = target_axis->getState();
         if (!state.online) {
+            target_axis->disable();
             setLastError("axis went offline during enableAxis");
             return false;
         }
@@ -537,6 +641,7 @@ bool ErobArmController::enableAxis(int axis_id) {
             return true;
         }
         if (state.fault) {
+            target_axis->disable();
             std::ostringstream stream;
             stream << "axis fault during enableAxis, error_code=0x" << std::hex << state.last_error_code;
             setLastError(stream.str());
@@ -545,6 +650,7 @@ bool ErobArmController::enableAxis(int axis_id) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    target_axis->disable();
     setLastError("enableAxis timed out before reaching operation enabled");
     return false;
 }
@@ -559,7 +665,33 @@ bool ErobArmController::disableAxis(int axis_id) {
         setLastError("axis is not bound to a motor");
         return false;
     }
-    return target_axis->disable();
+
+    AxisState state = target_axis->getState();
+    if (!state.online) {
+        setLastError("axis is not online yet");
+        return false;
+    }
+    if (!target_axis->disable()) {
+        setLastError(target_axis->lastError());
+        return false;
+    }
+
+    const auto disable_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (std::chrono::steady_clock::now() < disable_deadline) {
+        state = target_axis->getState();
+        if (!state.online) {
+            setLastError("axis went offline during disableAxis");
+            return false;
+        }
+        if (!state.enabled) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    setLastError("disableAxis timed out before drive left operation-enabled state");
+    return false;
 }
 
 bool ErobArmController::resetFault(int axis_id) {
@@ -572,7 +704,36 @@ bool ErobArmController::resetFault(int axis_id) {
         setLastError("axis is not bound to a motor");
         return false;
     }
-    return target_axis->resetFault();
+
+    AxisState state = target_axis->getState();
+    if (!state.online) {
+        setLastError("axis is not online yet");
+        return false;
+    }
+    if (!target_axis->resetFault()) {
+        setLastError(target_axis->lastError());
+        return false;
+    }
+
+    const auto reset_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < reset_deadline) {
+        state = target_axis->getState();
+        if (!state.online) {
+            setLastError("axis went offline during resetFault");
+            return false;
+        }
+        if (!state.fault && state.cia402_state != CiA402State::kFaultReactionActive) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    std::ostringstream stream;
+    stream << "resetFault timed out, state=" << CiA402StateName(state.cia402_state)
+           << ", error_code=0x" << std::hex << state.last_error_code;
+    setLastError(stream.str());
+    return false;
 }
 
 bool ErobArmController::enableAll() {
@@ -1216,6 +1377,125 @@ bool ErobArmController::canRescan() const {
             return false;
         }
     }
+    return true;
+}
+
+bool ErobArmController::discoverMotorsOnAdapter(
+    const std::string& adapter_name,
+    std::vector<MotorIdentity>* motors,
+    std::string* detail) {
+    EthercatMasterSession scanner;
+    LogControllerDebug(-1, "rescan adapter begin | adapter=" + DisplayAdapterName(adapter_name));
+    if (!scanner.connect(adapter_name)) {
+        if (detail != nullptr) {
+            *detail = "adapter " + adapter_name + " connect failed: " + scanner.lastError();
+        }
+        LogControllerDebug(-1, "rescan adapter connect failed | adapter=" + DisplayAdapterName(adapter_name) +
+            " | error=" + scanner.lastError());
+        return false;
+    }
+
+    std::vector<MotorIdentity> discovered;
+    if (!scanner.discoverMotors(&discovered)) {
+        const std::string error = scanner.lastError();
+        scanner.disconnect();
+        if (detail != nullptr) {
+            *detail = "adapter " + adapter_name + " discover failed: " + error;
+        }
+        LogControllerDebug(-1, "rescan adapter discover failed | adapter=" + DisplayAdapterName(adapter_name) +
+            " | error=" + error);
+        return false;
+    }
+
+    scanner.disconnect();
+    if (motors != nullptr) {
+        *motors = discovered;
+    }
+    if (detail != nullptr) {
+        *detail = "adapter " + adapter_name + " discovered " + std::to_string(discovered.size()) + " slave(s)";
+    }
+    LogControllerDebug(
+        -1,
+        "rescan adapter success | adapter=" + DisplayAdapterName(adapter_name) +
+            " | discovered_motors=" + std::to_string(discovered.size()));
+    return true;
+}
+
+bool ErobArmController::recoverBusAndRescanImpl(std::string* recovery_summary) {
+    if (!canRescan()) {
+        setLastError("bus recovery/rescan requires controller shutdown and all axes disabled");
+        return false;
+    }
+
+    const std::string preferred_adapter = !config_.preferred_adapter.empty()
+        ? config_.preferred_adapter
+        : master_.adapterName();
+    LogControllerDebug(
+        -1,
+        "bus recovery begin | preferred_adapter=" + DisplayAdapterName(preferred_adapter) +
+            " | discovered_motors_before=" + std::to_string(discovered_motors_.size()));
+
+    master_.disconnect();
+    LogControllerDebug(-1, "bus recovery clear complete | requested disconnect and INIT on previous session");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::vector<std::string> failure_details;
+    std::vector<MotorIdentity> recovered_motors;
+
+    if (!preferred_adapter.empty()) {
+        std::string detail;
+        if (!discoverMotorsOnAdapter(preferred_adapter, &recovered_motors, &detail)) {
+            failure_details.push_back(detail);
+        }
+    }
+
+    if (recovered_motors.empty()) {
+        LogControllerDebug(-1, "bus recovery fallback full rescan begin");
+        const std::vector<AdapterInfo> adapters = scanAdapters();
+        if (adapters.empty()) {
+            failure_details.push_back("no adapters found during bus recovery full rescan");
+        }
+        for (const AdapterInfo& adapter : adapters) {
+            if (!preferred_adapter.empty() && adapter.name == preferred_adapter) {
+                continue;
+            }
+
+            std::string detail;
+            if (discoverMotorsOnAdapter(adapter.name, &recovered_motors, &detail)) {
+                break;
+            }
+            failure_details.push_back(detail);
+        }
+    }
+
+    if (recovered_motors.empty()) {
+        const std::string detail = failure_details.empty()
+            ? std::string("bus recovery/rescan found no EtherCAT motors")
+            : JoinMessages(failure_details);
+        setLastError("bus recovery/rescan failed | " + detail);
+        return false;
+    }
+
+    discovered_motors_ = recovered_motors;
+    config_.preferred_adapter = recovered_motors.front().adapter_name;
+    config_manager_.saveDiscoveryCache(discoveryCachePath(), config_.preferred_adapter, discovered_motors_);
+    if (!autoBindDiscoveredMotors(discovered_motors_)) {
+        setLastError(
+            "bus recovery/rescan discovered motors but auto-bind failed | adapter=" +
+            DisplayAdapterName(config_.preferred_adapter));
+        return false;
+    }
+
+    if (recovery_summary != nullptr) {
+        *recovery_summary =
+            "adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size());
+    }
+    LogControllerDebug(
+        -1,
+        "bus recovery success | adapter=" + DisplayAdapterName(config_.preferred_adapter) +
+            " | discovered_motors=" + std::to_string(discovered_motors_.size()));
     return true;
 }
 

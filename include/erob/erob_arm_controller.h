@@ -22,6 +22,7 @@ public:
 
     bool initialize();
     bool shutdown();
+    bool recoverBusAndRescan();
 
     bool loadConfig(const std::string& path);
     bool saveConfig(const std::string& path) const;
@@ -66,11 +67,17 @@ private:
     const ErobAxis* axis(int axis_id) const;
     bool startThreads();
     void stopThreads();
+    bool initializeNoRecovery();
     void cycleLoop();
     void followLoop();
     void monitorLoop();
     bool loadDiscoveryCache();
     bool canRescan() const;
+    bool recoverBusAndRescanImpl(std::string* recovery_summary);
+    bool discoverMotorsOnAdapter(
+        const std::string& adapter_name,
+        std::vector<MotorIdentity>* motors,
+        std::string* detail);
     bool applyProfilePositionParams(uint16_t slave_index, const ProfilePositionParams& params);
     bool autoBindDiscoveredMotors(const std::vector<MotorIdentity>& motors);
     void rebuildAxesFromDiscoveredMotors(const std::vector<MotorIdentity>& motors);

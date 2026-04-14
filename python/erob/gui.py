@@ -723,6 +723,21 @@ class MainWindow(QMainWindow):
             raise ControllerError("；".join(errors))
         return axis_ids
 
+    def _run_axis_batch_parallel(self, axis_ids: list[int], operation: Callable[[int], None]) -> list[int]:
+        def run_single(axis_id: int) -> str | None:
+            try:
+                operation(axis_id)
+                return None
+            except Exception as error:
+                return f"axis {axis_id}: {error}"
+
+        max_workers = max(1, min(len(axis_ids), 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            errors = [message for message in executor.map(run_single, axis_ids) if message]
+        if errors:
+            raise ControllerError("；".join(errors))
+        return axis_ids
+
     def _submit_selected(self, label: str, operation: Callable[[int], None]) -> None:
         axis_ids = self.selected_axis_ids()
         if not axis_ids:
@@ -751,7 +766,7 @@ class MainWindow(QMainWindow):
         velocity = self.velocity_spin.value()
         self.submit(
             "move-selected",
-            lambda axes=axis_ids, target=angle, speed=velocity: self._run_axis_batch(
+            lambda axes=axis_ids, target=angle, speed=velocity: self._run_axis_batch_parallel(
                 axes,
                 lambda axis_id: self.controller.move_to(axis_id, target, speed),
             ),
@@ -781,11 +796,17 @@ class MainWindow(QMainWindow):
             self._prime_follow_dial_from_axis(axis_id)
         self.submit(
             "start-follow-selected",
-            lambda axes=selected_axes: self._run_axis_batch(axes, self.controller.start_follow),
+            lambda axes=selected_axes: self._run_axis_batch_parallel(axes, self.controller.start_follow),
         )
 
     def _stop_follow_selected(self) -> None:
-        self._submit_selected("stop-follow-selected", self.controller.stop_follow)
+        axis_ids = self.selected_axis_ids()
+        if not axis_ids:
+            return
+        self.submit(
+            "stop-follow-selected",
+            lambda axes=axis_ids: self._run_axis_batch_parallel(axes, self.controller.stop_follow),
+        )
 
     def _selected_follow_axes(self) -> list[int]:
         selected_axes = self.selected_axis_ids(silent=True)

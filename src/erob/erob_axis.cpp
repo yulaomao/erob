@@ -71,10 +71,14 @@ bool ErobAxis::enable() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     AxisCommand command = command_buffer_.load();
+    if (command.requested_mode == MotionMode::kNone) {
+        command.requested_mode = MotionMode::kProfilePosition;
+    }
     command.enable_requested = true;
     command.disable_requested = false;
     command.quick_stop_requested = false;
     command.reset_fault_requested = false;
+    command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
     return publishCommand(command);
 }
@@ -94,9 +98,12 @@ bool ErobAxis::disable() {
     interpolated_velocity_deg_s_ = 0.0;
     interp_step_ = 0;
     AxisCommand command = command_buffer_.load();
+    command.requested_mode = MotionMode::kProfilePosition;
     command.disable_requested = true;
     command.enable_requested = false;
     command.quick_stop_requested = false;
+    command.reset_fault_requested = false;
+    command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
     setPositionModeState(PositionModeState::kIdle);
     setFollowModeState(FollowModeState::kIdle);
@@ -106,10 +113,25 @@ bool ErobAxis::disable() {
 bool ErobAxis::resetFault() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
+    follow_active_.store(false, std::memory_order_release);
+    follow_positive_limit_hold_ = false;
+    follow_negative_limit_hold_ = false;
+    profile_transition_pending_ = false;
+    planner_velocity_deg_s_ = 0.0;
+    interp_start_velocity_deg_s_ = 0.0;
+    interp_target_velocity_deg_s_ = 0.0;
+    interpolated_velocity_deg_s_ = 0.0;
+    interp_step_ = 0;
     AxisCommand command = command_buffer_.load();
+    command.requested_mode = MotionMode::kProfilePosition;
     command.reset_fault_requested = true;
+    command.enable_requested = false;
+    command.disable_requested = true;
     command.quick_stop_requested = false;
+    command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    setPositionModeState(PositionModeState::kIdle);
+    setFollowModeState(FollowModeState::kIdle);
     return publishCommand(command);
 }
 

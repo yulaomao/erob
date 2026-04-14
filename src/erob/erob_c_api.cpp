@@ -210,6 +210,15 @@ int erob_controller_shutdown(ErobControllerHandle* handle) {
     return GuardBool(handle, [&]() { return handle->controller.shutdown(); });
 }
 
+const char* erob_controller_recover_bus_and_rescan_json(ErobControllerHandle* handle) {
+    return GuardString(handle, [&]() {
+        if (!handle->controller.recoverBusAndRescan()) {
+            return SerializeMotors(std::vector<erob::MotorIdentity>{});
+        }
+        return SerializeMotors(handle->controller.discoveredMotors());
+    });
+}
+
 int erob_controller_enable_axis(ErobControllerHandle* handle, int axis_id) {
     return GuardBool(handle, [&]() { return handle->controller.enableAxis(axis_id); });
 }

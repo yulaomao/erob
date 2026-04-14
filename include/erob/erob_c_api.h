@@ -72,6 +72,7 @@ EROB_C_API_EXPORT void erob_controller_destroy(ErobControllerHandle* handle);
 
 EROB_C_API_EXPORT int erob_controller_initialize(ErobControllerHandle* handle);
 EROB_C_API_EXPORT int erob_controller_shutdown(ErobControllerHandle* handle);
+EROB_C_API_EXPORT const char* erob_controller_recover_bus_and_rescan_json(ErobControllerHandle* handle);
 EROB_C_API_EXPORT int erob_controller_enable_axis(ErobControllerHandle* handle, int axis_id);
 EROB_C_API_EXPORT int erob_controller_disable_axis(ErobControllerHandle* handle, int axis_id);
 EROB_C_API_EXPORT int erob_controller_reset_fault(ErobControllerHandle* handle, int axis_id);

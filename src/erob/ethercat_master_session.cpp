@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <iostream>
 #include <sstream>
 
 #include "ethercatprint.h"
@@ -72,6 +73,27 @@ std::string FormatSlaveDiagnostics() {
     return stream.str();
 }
 
+std::string DisplayAdapterName(const std::string& adapter_name) {
+    return adapter_name.empty() ? std::string("-") : adapter_name;
+}
+
+std::string HexState(uint16_t state) {
+    std::ostringstream stream;
+    stream << std::hex << state;
+    return stream.str();
+}
+
+void LogMasterDebug(
+    const std::string& adapter_name,
+    const std::string& stage,
+    const std::string& message) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << "[erob-master-debug] adapter=" << DisplayAdapterName(adapter_name)
+              << " stage=" << stage
+              << " | " << message << std::endl;
+}
+
 template <typename T>
 bool SdoWrite(uint16_t slave, uint16_t index, uint8_t subindex, const T& value) {
     T local = value;
@@ -105,7 +127,13 @@ std::vector<AdapterInfo> EthercatMasterSession::scanAdapters() {
         AdapterInfo info;
         info.name = adapter->name;
         info.description = adapter->desc;
+        LogMasterDebug(info.name, "scan/probe", "begin adapter probe");
         info.scan_success = ProbeAdapter(info.name, &info.discovered_slave_count);
+        LogMasterDebug(
+            info.name,
+            "scan/probe",
+            std::string(info.scan_success ? "probe succeeded" : "probe failed") +
+                " | discovered_slave_count=" + std::to_string(info.discovered_slave_count));
         adapters.push_back(info);
     }
     ec_free_adapters(list);
@@ -283,21 +311,32 @@ bool EthercatMasterSession::connectNoLock(const std::string& adapter_name) {
         setLastErrorNoLock("adapter name is empty");
         return false;
     }
-    if (ec_init(adapter_name.c_str()) <= 0) {
-        setLastErrorNoLock("failed to initialize EtherCAT master on adapter " + adapter_name);
+    LogMasterDebug(adapter_name, "connect/raw-socket", "begin ec_init(adapter)");
+    const int init_result = ec_init(adapter_name.c_str());
+    if (init_result <= 0) {
+        LogMasterDebug(adapter_name, "connect/raw-socket", "ec_init failed");
+        setLastErrorNoLock("connect(raw-socket) failed to initialize EtherCAT master on adapter " + adapter_name);
         return false;
     }
     adapter_name_ = adapter_name;
     connected_ = true;
     operational_ = false;
+    LogMasterDebug(adapter_name_, "connect/raw-socket", "ec_init succeeded; raw socket/session ready");
     return true;
 }
 
 void EthercatMasterSession::disconnectNoLock() {
     if (connected_) {
+        LogMasterDebug(adapter_name_, "disconnect/clear", "request INIT begin");
         ec_slave[0].state = EC_STATE_INIT;
         ec_writestate(0);
+        ec_readstate();
+        LogMasterDebug(
+            adapter_name_,
+            "disconnect/clear",
+            "request INIT sent | master_state=0x" + HexState(ec_slave[0].state));
         ec_close();
+        LogMasterDebug(adapter_name_, "disconnect/clear", "ec_close completed");
     }
     adapter_name_.clear();
     connected_ = false;
@@ -318,13 +357,20 @@ bool EthercatMasterSession::discoverMotorsNoLock(std::vector<MotorIdentity>* mot
     }
 
     motors->clear();
+    LogMasterDebug(adapter_name_, "discover/ec_config_init", "begin ec_config_init(FALSE)");
     const int slave_count = ec_config_init(FALSE);
     if (slave_count <= 0) {
-        setLastErrorNoLock("no EtherCAT slaves found on adapter " + adapter_name_);
+        LogMasterDebug(adapter_name_, "discover/ec_config_init", "ec_config_init returned no slaves");
+        setLastErrorNoLock("discover(ec_config_init(FALSE)) found no EtherCAT slaves on adapter " + adapter_name_);
         return false;
     }
 
     ec_readstate();
+    LogMasterDebug(
+        adapter_name_,
+        "discover/ec_config_init",
+        "ec_config_init succeeded | slave_count=" + std::to_string(slave_count) +
+            " | diagnostics=" + FormatSlaveDiagnostics());
     for (int slave = 1; slave <= ec_slavecount; ++slave) {
         motors->push_back(motorIdentityNoLock(static_cast<uint16_t>(slave)));
     }
@@ -333,6 +379,7 @@ bool EthercatMasterSession::discoverMotorsNoLock(std::vector<MotorIdentity>* mot
 }
 
 bool EthercatMasterSession::configurePdosNoLock() {
+    LogMasterDebug(adapter_name_, "pdo-map", "begin configure PDO mapping");
     if (!ensurePreOperationalNoLock()) {
         return false;
     }
@@ -342,6 +389,7 @@ bool EthercatMasterSession::configurePdosNoLock() {
             !mapTxPdoNoLock(static_cast<uint16_t>(slave))) {
             std::ostringstream message;
             message << "failed to configure PDO for slave " << slave;
+            LogMasterDebug(adapter_name_, "pdo-map", message.str());
             setLastErrorNoLock(message.str());
             return false;
         }
@@ -350,6 +398,10 @@ bool EthercatMasterSession::configurePdosNoLock() {
     ecx_context.manualstatechange = 1;
     ec_config_map(iomap_);
     expected_wkc_ = (ec_group[0].outputsWKC * 2) + ec_group[0].inputsWKC;
+    LogMasterDebug(
+        adapter_name_,
+        "pdo-map",
+        "PDO mapping complete | expected_wkc=" + std::to_string(expected_wkc_));
     return true;
 }
 
@@ -359,6 +411,7 @@ bool EthercatMasterSession::requestSafeOperationalNoLock() {
         return false;
     }
 
+    LogMasterDebug(adapter_name_, "state-switch/SAFE_OP", "begin request SAFE_OP");
     ec_readstate();
     for (int slave = 1; slave <= ec_slavecount; ++slave) {
         if (ec_slave[slave].state == (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
@@ -371,9 +424,14 @@ bool EthercatMasterSession::requestSafeOperationalNoLock() {
     ec_writestate(0);
     if (ec_statecheck(0, EC_STATE_SAFE_OP, 5 * EC_TIMEOUTSTATE) != EC_STATE_SAFE_OP) {
         ec_readstate();
+        LogMasterDebug(
+            adapter_name_,
+            "state-switch/SAFE_OP",
+            "failed | diagnostics=" + FormatSlaveDiagnostics());
         setLastErrorNoLock("failed to switch slaves to SAFE_OP | " + FormatSlaveDiagnostics());
         return false;
     }
+    LogMasterDebug(adapter_name_, "state-switch/SAFE_OP", "success");
     return true;
 }
 
@@ -384,18 +442,29 @@ bool EthercatMasterSession::configureDistributedClocksNoLock(int64_t cycle_ns) {
     }
 
     if (cycle_ns <= 0) {
+        LogMasterDebug(adapter_name_, "distributed-clocks", "disable DC sync on all slaves");
         for (int slave = 1; slave <= ec_slavecount; ++slave) {
             ec_dcsync0(slave, FALSE, 0, 0);
         }
         return true;
     }
 
+    LogMasterDebug(
+        adapter_name_,
+        "distributed-clocks",
+        "begin configure DC | cycle_ns=" + std::to_string(cycle_ns));
     ec_configdc();
+    int dc_slave_count = 0;
     for (int slave = 1; slave <= ec_slavecount; ++slave) {
         if (ec_slave[slave].hasdc) {
             ec_dcsync0(slave, TRUE, cycle_ns, 0);
+            ++dc_slave_count;
         }
     }
+    LogMasterDebug(
+        adapter_name_,
+        "distributed-clocks",
+        "DC configured | dc_slave_count=" + std::to_string(dc_slave_count));
     return true;
 }
 
@@ -405,19 +474,78 @@ bool EthercatMasterSession::requestOperationalNoLock() {
         return false;
     }
 
-    ec_slave[0].state = EC_STATE_OPERATIONAL;
-    ec_send_processdata();
-    last_wkc_ = ec_receive_processdata(EC_TIMEOUTRET);
-    ec_writestate(0);
+    LogMasterDebug(adapter_name_, "state-switch/OPERATIONAL", "begin request OPERATIONAL");
+    RxPdoUnified safe_pdo{};
+    safe_pdo.controlword = 0x0000;
+    safe_pdo.target_position = 0;
+    safe_pdo.target_velocity = 0;
+    safe_pdo.mode_of_operation = MotionModeToCia402Value(MotionMode::kProfilePosition);
+    safe_pdo.padding = 0;
 
-    int retries = 200;
-    while (retries-- > 0) {
-        ec_send_processdata();
-        last_wkc_ = ec_receive_processdata(EC_TIMEOUTRET);
-        if (ec_statecheck(0, EC_STATE_OPERATIONAL, 50000) == EC_STATE_OPERATIONAL) {
-            operational_ = true;
-            return true;
+    auto write_safe_outputs = [&]() {
+        for (int slave = 1; slave <= ec_slavecount; ++slave) {
+            if (ec_slave[slave].outputs == nullptr ||
+                ec_slave[slave].Obytes < static_cast<int>(sizeof(RxPdoUnified))) {
+                continue;
+            }
+            std::memcpy(ec_slave[slave].outputs, &safe_pdo, sizeof(safe_pdo));
         }
+    };
+
+    auto prime_safe_process_data = [&](int cycles) {
+        for (int cycle = 0; cycle < cycles; ++cycle) {
+            write_safe_outputs();
+            ec_send_processdata();
+            last_wkc_ = ec_receive_processdata(EC_TIMEOUTRET);
+        }
+    };
+
+    constexpr int kPrimeCyclesBeforeOp = 20;
+    constexpr int kPrimeCyclesAfterOp = 10;
+    constexpr int kOperationalRequestAttempts = 3;
+
+    for (int attempt = 1; attempt <= kOperationalRequestAttempts; ++attempt) {
+        ec_readstate();
+        for (int slave = 1; slave <= ec_slavecount; ++slave) {
+            if (ec_slave[slave].state == (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
+                ec_slave[slave].state = EC_STATE_SAFE_OP + EC_STATE_ACK;
+                ec_writestate(static_cast<uint16_t>(slave));
+            }
+        }
+
+        ec_slave[0].state = EC_STATE_SAFE_OP;
+        ec_writestate(0);
+        ec_statecheck(0, EC_STATE_SAFE_OP, 5 * EC_TIMEOUTSTATE);
+
+        prime_safe_process_data(kPrimeCyclesBeforeOp);
+
+        ec_slave[0].state = EC_STATE_OPERATIONAL;
+        ec_writestate(0);
+
+        int retries = 200;
+        while (retries-- > 0) {
+            write_safe_outputs();
+            ec_send_processdata();
+            last_wkc_ = ec_receive_processdata(EC_TIMEOUTRET);
+            if (ec_statecheck(0, EC_STATE_OPERATIONAL, 50000) == EC_STATE_OPERATIONAL) {
+                operational_ = true;
+                prime_safe_process_data(kPrimeCyclesAfterOp);
+                LogMasterDebug(
+                    adapter_name_,
+                    "state-switch/OPERATIONAL",
+                    "success | op_attempt=" + std::to_string(attempt) +
+                        " | expected_wkc=" + std::to_string(expected_wkc_) +
+                        " | last_wkc=" + std::to_string(last_wkc_));
+                return true;
+            }
+        }
+
+        ec_readstate();
+        LogMasterDebug(
+            adapter_name_,
+            "state-switch/OPERATIONAL",
+            "retry required | op_attempt=" + std::to_string(attempt) +
+                " | diagnostics=" + FormatSlaveDiagnostics());
     }
 
     if (ec_slave[0].state != EC_STATE_OPERATIONAL) {
@@ -427,12 +555,14 @@ bool EthercatMasterSession::requestOperationalNoLock() {
                << " | expected_wkc=" << expected_wkc_
                << ", last_wkc=" << last_wkc_
                << " | " << FormatSlaveDiagnostics();
+        LogMasterDebug(adapter_name_, "state-switch/OPERATIONAL", stream.str());
         setLastErrorNoLock(stream.str());
         operational_ = false;
         return false;
     }
 
     operational_ = true;
+    LogMasterDebug(adapter_name_, "state-switch/OPERATIONAL", "success without retries exhausted");
     return true;
 }
 
@@ -615,13 +745,20 @@ bool EthercatMasterSession::ensurePreOperationalNoLock() {
         setLastErrorNoLock("EtherCAT master is not connected");
         return false;
     }
+    LogMasterDebug(adapter_name_, "state-switch/PRE_OP", "begin request PRE_OP");
     ec_readstate();
     ec_slave[0].state = EC_STATE_PRE_OP;
     ec_writestate(0);
     if (ec_statecheck(0, EC_STATE_PRE_OP, 3 * EC_TIMEOUTSTATE) != EC_STATE_PRE_OP) {
-        setLastErrorNoLock("failed to switch slaves to PRE_OP");
+        ec_readstate();
+        LogMasterDebug(
+            adapter_name_,
+            "state-switch/PRE_OP",
+            "failed | diagnostics=" + FormatSlaveDiagnostics());
+        setLastErrorNoLock("failed to switch slaves to PRE_OP | " + FormatSlaveDiagnostics());
         return false;
     }
+    LogMasterDebug(adapter_name_, "state-switch/PRE_OP", "success");
     return true;
 }
 
