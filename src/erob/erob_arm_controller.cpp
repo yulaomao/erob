@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <iostream>
+#include <mutex>
 #include <pthread.h>
 #include <sched.h>
 #include <sstream>
@@ -173,6 +175,22 @@ bool IsFollowModeBusy(const AxisState& state, const ErobAxis* axis_ptr) {
         state.motion_mode == MotionMode::kCyclicSyncVelocity;
 }
 
+bool IsSyncRelatedOperationalFailure(const std::string& error) {
+    return error.find("Synchronization error") != std::string::npos ||
+        error.find("AL=0x1a") != std::string::npos ||
+        error.find("AL=0x1b") != std::string::npos ||
+        error.find("AL=0x30") != std::string::npos ||
+        error.find("Sync manager watchdog") != std::string::npos ||
+        error.find("DC ") != std::string::npos;
+}
+
+void LogControllerDebug(int axis_id, const std::string& message) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << "[erob-controller-debug] axis=" << axis_id
+              << " | " << message << std::endl;
+}
+
 }  // namespace
 
 ErobArmController::ErobArmController(std::string config_path)
@@ -210,15 +228,13 @@ bool ErobArmController::initialize() {
     }
     if (!master_.requestOperational()) {
         const std::string op_error = master_.lastError();
-        const bool sync_related =
-            op_error.find("Synchronization error") != std::string::npos ||
-            op_error.find("AL=0x1a") != std::string::npos ||
-            op_error.find("AL=0x30") != std::string::npos ||
-            op_error.find("DC ") != std::string::npos;
+        const bool sync_related = IsSyncRelatedOperationalFailure(op_error);
         if (!sync_related) {
             setLastError(op_error);
             return false;
         }
+
+        LogControllerDebug(-1, "initialize OP retry without DC after: " + op_error);
 
         if (!master_.configureDistributedClocks(0)) {
             setLastError(master_.lastError());
@@ -232,6 +248,8 @@ bool ErobArmController::initialize() {
             setLastError(master_.lastError() + " | retry_without_dc=failed");
             return false;
         }
+
+        LogControllerDebug(-1, "initialize OP retry without DC succeeded");
     }
     if (!startThreads()) {
         return false;
@@ -638,6 +656,20 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
             return false;
         }
     }
+    {
+        std::ostringstream stream;
+        stream << std::fixed << std::setprecision(2)
+               << "moveTo request issued"
+               << " request_id=" << request_id
+               << " actual_deg=" << ready_state.actual_angle_deg
+               << " target_deg=" << angle_deg
+               << " velocity_deg_s=" << velocity_deg_s
+               << " statusword=0x" << std::hex << ready_state.statusword << std::dec
+               << " cia402=" << CiA402StateName(ready_state.cia402_state)
+               << " mode=" << MotionModeName(ready_state.motion_mode)
+               << " | " << target_axis->profilePositionDebugString();
+        LogControllerDebug(axis_id, stream.str());
+    }
 
     const AxisConfig& axis_config = target_axis->config();
     const int timeout_ms = EstimateProfilePositionTimeoutMs(
@@ -647,6 +679,7 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         velocity_deg_s);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto next_debug_log = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
     const double initial_angle_deg = ready_state.actual_angle_deg;
     bool retriggered = false;
 
@@ -678,17 +711,67 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
                 std::fabs(current_state.actual_velocity_deg_s) <= 0.5;
             if (still_not_moving) {
                 retriggered = true;
+                {
+                    std::ostringstream stream;
+                    stream << std::fixed << std::setprecision(2)
+                           << "moveTo retrigger"
+                           << " request_id=" << request_id
+                           << " actual_deg=" << current_state.actual_angle_deg
+                           << " target_deg=" << current_state.target_angle_deg
+                           << " error_deg=" << current_state.position_error_deg
+                           << " velocity_deg_s=" << current_state.actual_velocity_deg_s
+                           << " statusword=0x" << std::hex << current_state.statusword << std::dec
+                           << " | " << target_axis->profilePositionDebugString();
+                    LogControllerDebug(axis_id, stream.str());
+                }
                 if (!target_axis->retriggerProfilePositionTarget(request_id)) {
                     setLastError("moveTo failed to retrigger profile position set-point");
                     return false;
                 }
             }
         }
+        if (std::chrono::steady_clock::now() >= next_debug_log) {
+            next_debug_log = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            std::ostringstream stream;
+            stream << std::fixed << std::setprecision(2)
+                   << "moveTo waiting"
+                   << " request_id=" << request_id
+                   << " actual_deg=" << current_state.actual_angle_deg
+                   << " target_deg=" << current_state.target_angle_deg
+                   << " error_deg=" << current_state.position_error_deg
+                   << " velocity_deg_s=" << current_state.actual_velocity_deg_s
+                   << " statusword=0x" << std::hex << current_state.statusword << std::dec
+                   << " controlword=0x" << std::hex << current_state.controlword << std::dec
+                   << " cia402=" << CiA402StateName(current_state.cia402_state)
+                   << " mode=" << MotionModeName(current_state.motion_mode)
+                   << " position_state=" << PositionModeStateName(current_state.position_mode_state)
+                   << " target_reached=" << (current_state.target_reached ? "true" : "false")
+                   << " | " << target_axis->profilePositionDebugString();
+            LogControllerDebug(axis_id, stream.str());
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     const AxisState timed_out_state = target_axis->getState();
     target_axis->markProfilePositionTimeout();
+    {
+        std::ostringstream debug_stream;
+        debug_stream << std::fixed << std::setprecision(2)
+                     << "moveTo timeout"
+                     << " request_id=" << request_id
+                     << " actual_deg=" << timed_out_state.actual_angle_deg
+                     << " target_deg=" << timed_out_state.target_angle_deg
+                     << " error_deg=" << timed_out_state.position_error_deg
+                     << " velocity_deg_s=" << timed_out_state.actual_velocity_deg_s
+                     << " statusword=0x" << std::hex << timed_out_state.statusword << std::dec
+                     << " controlword=0x" << std::hex << timed_out_state.controlword << std::dec
+                     << " cia402=" << CiA402StateName(timed_out_state.cia402_state)
+                     << " mode=" << MotionModeName(timed_out_state.motion_mode)
+                     << " position_state=" << PositionModeStateName(timed_out_state.position_mode_state)
+                     << " target_reached=" << (timed_out_state.target_reached ? "true" : "false")
+                     << " | " << target_axis->profilePositionDebugString();
+        LogControllerDebug(axis_id, debug_stream.str());
+    }
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(2)
            << "moveTo timed out before target reached after " << timeout_ms
@@ -698,10 +781,12 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
            << " | error_deg=" << timed_out_state.position_error_deg
            << " | velocity_deg_s=" << timed_out_state.actual_velocity_deg_s
            << " | statusword=0x" << std::hex << timed_out_state.statusword << std::dec
+           << " | controlword=0x" << std::hex << timed_out_state.controlword << std::dec
            << " | cia402=" << CiA402StateName(timed_out_state.cia402_state)
            << " | mode=" << MotionModeName(timed_out_state.motion_mode)
            << " | position_state=" << PositionModeStateName(timed_out_state.position_mode_state)
-           << " | target_reached=" << (timed_out_state.target_reached ? "true" : "false");
+           << " | target_reached=" << (timed_out_state.target_reached ? "true" : "false")
+           << " | " << target_axis->profilePositionDebugString();
     setLastError(stream.str());
     return false;
 }

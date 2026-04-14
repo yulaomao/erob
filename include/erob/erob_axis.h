@@ -45,6 +45,7 @@ public:
     bool isFollowActive() const;
     uint64_t profileRequestId() const;
     uint64_t followRequestId() const;
+    std::string profilePositionDebugString() const;
     uint16_t slaveIndex() const;
     bool hasBoundMotor() const;
 

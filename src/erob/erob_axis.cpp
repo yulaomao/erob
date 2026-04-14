@@ -1,6 +1,10 @@
 #include "erob/erob_axis.h"
 
+#include <iomanip>
+#include <iostream>
 #include <cmath>
+#include <mutex>
+#include <sstream>
 
 namespace erob {
 
@@ -10,6 +14,15 @@ constexpr double kFollowInputMinAngleDeg = -130.0;
 constexpr double kFollowInputMaxAngleDeg = 130.0;
 constexpr double kFollowFirstJumpLimitDeg = 40.0;
 constexpr double kFollowJumpLimitDeg = 20.0;
+
+void LogAxisDebug(const AxisConfig& config, const std::string& message) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << "[erob-axis-debug] axis=" << config.logical_axis_id
+              << " joint=" << config.joint_name
+              << " slave=" << config.bound_motor.slave_index
+              << " | " << message << std::endl;
+}
 
 }  // namespace
 
@@ -167,6 +180,19 @@ bool ErobAxis::setProfilePositionTarget(
         : PositionModeState::kWaitingEnable;
     state.follow_mode_state = FollowModeState::kIdle;
     state_buffer_.publish(state);
+    {
+        std::ostringstream stream;
+        stream << std::fixed << std::setprecision(2)
+               << "queue PP request_id=" << new_request_id
+               << " sequence=" << command.sequence
+               << " target_deg=" << clamped_angle
+               << " target_count=" << angleToCount(clamped_angle)
+               << " velocity_deg_s=" << limited_velocity
+               << " profile_vel=" << params->profile_velocity
+               << " profile_acc=" << params->profile_acceleration
+               << " profile_dec=" << params->profile_deceleration;
+        LogAxisDebug(config_, stream.str());
+    }
     if (request_id != nullptr) {
         *request_id = new_request_id;
     }
@@ -241,6 +267,16 @@ bool ErobAxis::retriggerProfilePositionTarget(uint64_t request_id) {
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
     profile_transition_pending_ = true;
     setPositionModeState(PositionModeState::kSendingSetpoint);
+    {
+        std::ostringstream stream;
+        stream << std::fixed << std::setprecision(2)
+               << "retrigger PP request_id=" << request_id
+               << " sequence=" << command.sequence
+               << " target_deg=" << pending_profile_target_deg_
+               << " target_count=" << angleToCount(pending_profile_target_deg_)
+               << " velocity_deg_s=" << pending_profile_velocity_deg_s_;
+        LogAxisDebug(config_, stream.str());
+    }
     return publishCommand(command);
 }
 
@@ -542,8 +578,8 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     const AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
-    constexpr uint16_t kPpControlwordBase = 0x002FU;
-    constexpr uint16_t kPpControlwordNewSetpoint = 0x003FU;
+    constexpr uint16_t kPpControlwordBase = 0x000FU;
+    constexpr uint16_t kPpControlwordNewSetpoint = 0x001FU;
     constexpr int kPpPulseCycles = 2;
     const bool control_transition_requested =
         command.quick_stop_requested ||
@@ -558,6 +594,16 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
             pp_pulse_cycles_remaining_ = 0;
             profile_transition_pending_ = true;
             setPositionModeState(PositionModeState::kSendingSetpoint);
+            {
+                std::ostringstream stream;
+                stream << std::fixed << std::setprecision(2)
+                       << "arm PP cycle sequence=" << command.sequence
+                       << " request_id=" << profile_request_id_.load(std::memory_order_acquire)
+                       << " target_deg=" << command.target_angle_deg
+                       << " target_count=" << target_position_count_
+                       << " toggle=0x" << std::hex << pp_control_toggle_ << std::dec;
+                LogAxisDebug(config_, stream.str());
+            }
         } else if (!control_transition_requested && command.requested_mode == MotionMode::kCyclicSyncVelocity) {
             interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
             interp_target_velocity_deg_s_ = command.target_velocity_deg_s;
@@ -608,8 +654,22 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
             pdo.controlword = static_cast<uint16_t>(kPpControlwordBase | pp_control_toggle_);
             profile_transition_pending_ = false;
             pp_pulse_cycles_remaining_ = kPpPulseCycles;
+            {
+                std::ostringstream stream;
+                stream << "PP base controlword=0x" << std::hex << pdo.controlword << std::dec
+                       << " pulse_cycles=" << pp_pulse_cycles_remaining_
+                       << " target_count=" << pdo.target_position;
+                LogAxisDebug(config_, stream.str());
+            }
         } else if (pp_pulse_cycles_remaining_ > 0) {
             pdo.controlword = static_cast<uint16_t>(kPpControlwordNewSetpoint | pp_control_toggle_);
+            if (pp_pulse_cycles_remaining_ == kPpPulseCycles) {
+                std::ostringstream stream;
+                stream << "PP new-setpoint controlword=0x" << std::hex << pdo.controlword << std::dec
+                       << " pulse_cycles=" << pp_pulse_cycles_remaining_
+                       << " target_count=" << pdo.target_position;
+                LogAxisDebug(config_, stream.str());
+            }
             --pp_pulse_cycles_remaining_;
         }
     }
@@ -644,6 +704,28 @@ uint64_t ErobAxis::profileRequestId() const {
 uint64_t ErobAxis::followRequestId() const {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return follow_request_id_.load(std::memory_order_acquire);
+}
+
+std::string ErobAxis::profilePositionDebugString() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+    const AxisState state = state_buffer_.load();
+    const AxisCommand command = command_buffer_.load();
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(2)
+           << "profile_req=" << profile_request_id_.load(std::memory_order_acquire)
+           << " cmd_seq=" << command.sequence
+           << " last_cycle_seq=" << last_cycle_sequence_
+           << " profile_pending=" << (profile_transition_pending_ ? "true" : "false")
+           << " pulse_cycles=" << pp_pulse_cycles_remaining_
+           << " toggle=0x" << std::hex << pp_control_toggle_ << std::dec
+           << " target_count=" << target_position_count_
+           << " pending_target_deg=" << pending_profile_target_deg_
+           << " pending_velocity_deg_s=" << pending_profile_velocity_deg_s_
+           << " state_controlword=0x" << std::hex << state.controlword << std::dec
+           << " state_statusword=0x" << std::hex << state.statusword << std::dec
+           << " cmd_mode=" << MotionModeName(command.requested_mode)
+           << " state_mode=" << MotionModeName(state.motion_mode);
+    return stream.str();
 }
 
 uint16_t ErobAxis::slaveIndex() const {
