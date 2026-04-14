@@ -40,6 +40,8 @@ bool ErobAxis::enable() {
 bool ErobAxis::disable() {
     quick_stop_latched_.store(false, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
+    follow_positive_limit_hold_ = false;
+    follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
@@ -68,6 +70,8 @@ bool ErobAxis::resetFault() {
 bool ErobAxis::quickStop() {
     quick_stop_latched_.store(true, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
+    follow_positive_limit_hold_ = false;
+    follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
@@ -120,6 +124,8 @@ bool ErobAxis::setProfilePositionTarget(
         state.follow_mode_state != FollowModeState::kIdle;
 
     follow_active_.store(false, std::memory_order_release);
+    follow_positive_limit_hold_ = false;
+    follow_negative_limit_hold_ = false;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
@@ -175,6 +181,8 @@ bool ErobAxis::enterFollowMode(uint64_t* request_id) {
     const uint64_t new_request_id = next_follow_request_id_.fetch_add(1, std::memory_order_relaxed);
     follow_request_id_.store(new_request_id, std::memory_order_release);
     follow_active_.store(true, std::memory_order_release);
+    follow_positive_limit_hold_ = false;
+    follow_negative_limit_hold_ = false;
     last_follow_target_ns_.store(SteadyClockNowNs(), std::memory_order_release);
     follow_target_deg_.store(state.actual_angle_deg, std::memory_order_release);
     planner_filtered_target_deg_ = state.actual_angle_deg;
@@ -228,6 +236,8 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
         next_profile_request_id_.fetch_add(1, std::memory_order_relaxed),
         std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
+    follow_positive_limit_hold_ = false;
+    follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
@@ -284,20 +294,36 @@ void ErobAxis::planFollowStep() {
         config_.follow.target_filter_alpha * clamped_target +
         (1.0 - config_.follow.target_filter_alpha) * planner_filtered_target_deg_;
 
-    const double limit_settle_band_deg = std::max(0.2, config_.follow.deadband_deg * 4.0);
-    const bool saturated_to_positive_limit =
-        clamped_target >= (config_.max_angle_deg - 1e-6) &&
-        state.actual_angle_deg >= (config_.max_angle_deg - limit_settle_band_deg);
-    const bool saturated_to_negative_limit =
-        clamped_target <= (config_.min_angle_deg + 1e-6) &&
-        state.actual_angle_deg <= (config_.min_angle_deg + limit_settle_band_deg);
+    const double limit_hold_band_deg = std::max(0.5, config_.follow.deadband_deg * 10.0);
+    const double limit_release_band_deg = limit_hold_band_deg * 2.0;
+    const bool target_at_positive_limit = clamped_target >= (config_.max_angle_deg - 1e-6);
+    const bool target_at_negative_limit = clamped_target <= (config_.min_angle_deg + 1e-6);
 
-    if (saturated_to_positive_limit || saturated_to_negative_limit) {
+    if (follow_positive_limit_hold_ && clamped_target < (config_.max_angle_deg - limit_release_band_deg)) {
+        follow_positive_limit_hold_ = false;
+    }
+    if (follow_negative_limit_hold_ && clamped_target > (config_.min_angle_deg + limit_release_band_deg)) {
+        follow_negative_limit_hold_ = false;
+    }
+
+    if (!follow_positive_limit_hold_ && !follow_negative_limit_hold_) {
+        if (target_at_positive_limit &&
+            state.actual_angle_deg >= (config_.max_angle_deg - limit_hold_band_deg)) {
+            follow_positive_limit_hold_ = true;
+        } else if (target_at_negative_limit &&
+                   state.actual_angle_deg <= (config_.min_angle_deg + limit_hold_band_deg)) {
+            follow_negative_limit_hold_ = true;
+        }
+    }
+
+    const bool holding_limit = follow_positive_limit_hold_ || follow_negative_limit_hold_;
+    if (holding_limit) {
         planner_filtered_target_deg_ = Clamp(
             state.actual_angle_deg,
             config_.min_angle_deg,
             config_.max_angle_deg);
         desired_velocity = 0.0;
+        planner_velocity_deg_s_ = 0.0;
     } else {
         const double error = planner_filtered_target_deg_ - state.actual_angle_deg;
         if (std::fabs(error) > config_.follow.deadband_deg) {
@@ -310,14 +336,16 @@ void ErobAxis::planFollowStep() {
         -config_.follow.max_velocity_deg_s,
         config_.follow.max_velocity_deg_s);
 
-    const double max_accel = desired_velocity >= planner_velocity_deg_s_
-        ? config_.follow.max_accel_deg_s2
-        : config_.follow.max_decel_deg_s2;
-    const double accel_step = max_accel * dt;
-    if (desired_velocity > planner_velocity_deg_s_) {
-        desired_velocity = std::min(desired_velocity, planner_velocity_deg_s_ + accel_step);
-    } else {
-        desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
+    if (!holding_limit) {
+        const double max_accel = desired_velocity >= planner_velocity_deg_s_
+            ? config_.follow.max_accel_deg_s2
+            : config_.follow.max_decel_deg_s2;
+        const double accel_step = max_accel * dt;
+        if (desired_velocity > planner_velocity_deg_s_) {
+            desired_velocity = std::min(desired_velocity, planner_velocity_deg_s_ + accel_step);
+        } else {
+            desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
+        }
     }
 
     planner_velocity_deg_s_ = desired_velocity;
@@ -437,14 +465,19 @@ void ErobAxis::markProfilePositionTimeout() {
 RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     const AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
+    const bool control_transition_requested =
+        command.quick_stop_requested ||
+        command.disable_requested ||
+        command.reset_fault_requested ||
+        !command.enable_requested;
 
     if (command.sequence != last_cycle_sequence_) {
-        if (command.requested_mode == MotionMode::kProfilePosition) {
+        if (!control_transition_requested && command.requested_mode == MotionMode::kProfilePosition) {
             target_position_count_ = angleToCount(command.target_angle_deg);
             pp_control_toggle_ ^= 0x0040U;
             pp_pulse_cycles_remaining_ = 1;
             setPositionModeState(PositionModeState::kSendingSetpoint);
-        } else if (command.requested_mode == MotionMode::kCyclicSyncVelocity) {
+        } else if (!control_transition_requested && command.requested_mode == MotionMode::kCyclicSyncVelocity) {
             interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
             interp_target_velocity_deg_s_ = command.target_velocity_deg_s;
             interp_steps_ = std::max(1, cycle_hz / std::max(1, static_cast<int>(config_.follow.control_rate_hz)));
@@ -452,6 +485,8 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
             if (follow_active_.load(std::memory_order_acquire)) {
                 setFollowModeState(FollowModeState::kEnteringCsvMode);
             }
+        } else if (control_transition_requested) {
+            pp_pulse_cycles_remaining_ = 0;
         }
         last_cycle_sequence_ = command.sequence;
     }
@@ -463,7 +498,8 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     pdo.controlword = computeControlword(state, command);
     pdo.target_position = target_position_count_;
 
-    if (command.requested_mode == MotionMode::kProfilePosition &&
+    if (!control_transition_requested &&
+        command.requested_mode == MotionMode::kProfilePosition &&
         state.cia402_state == CiA402State::kOperationEnabled) {
         pdo.controlword = static_cast<uint16_t>(0x000FU | pp_control_toggle_);
     }
@@ -483,7 +519,8 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
         pdo.target_position = state.actual_position_count;
     }
 
-    if (command.requested_mode == MotionMode::kProfilePosition &&
+    if (!control_transition_requested &&
+        command.requested_mode == MotionMode::kProfilePosition &&
         state.cia402_state == CiA402State::kOperationEnabled &&
         pp_pulse_cycles_remaining_ > 0) {
         pdo.controlword = static_cast<uint16_t>(0x001FU | pp_control_toggle_);

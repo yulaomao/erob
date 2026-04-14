@@ -77,6 +77,8 @@ private:
 
     double planner_filtered_target_deg_ = 0.0;
     double planner_velocity_deg_s_ = 0.0;
+    bool follow_positive_limit_hold_ = false;
+    bool follow_negative_limit_hold_ = false;
     bool profile_transition_pending_ = false;
     double pending_profile_target_deg_ = 0.0;
     double pending_profile_velocity_deg_s_ = 0.0;
