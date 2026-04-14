@@ -1,5 +1,6 @@
-#include "erob/erob_axis.h"
 
+// 轴控制相关实现文件，负责单个电机轴的状态管理、指令下发、模式切换等核心逻辑。
+#include "erob/erob_axis.h"
 #include <iomanip>
 #include <iostream>
 #include <cmath>
@@ -10,11 +11,15 @@ namespace erob {
 
 namespace {
 
+// 跟随模式输入角度允许的最小/最大值（单位：度）
 constexpr double kFollowInputMinAngleDeg = -130.0;
 constexpr double kFollowInputMaxAngleDeg = 130.0;
+// 跟随模式首次目标跳变允许的最大角度
 constexpr double kFollowFirstJumpLimitDeg = 40.0;
+// 跟随模式后续目标跳变允许的最大角度
 constexpr double kFollowJumpLimitDeg = 20.0;
 
+// 线程安全的调试日志输出，便于定位轴的状态变化
 void LogAxisDebug(const AxisConfig& config, const std::string& message) {
     static std::mutex log_mutex;
     std::lock_guard<std::mutex> lock(log_mutex);
@@ -26,30 +31,42 @@ void LogAxisDebug(const AxisConfig& config, const std::string& message) {
 
 }  // namespace
 
-ErobAxis::ErobAxis(const AxisConfig& config)
-    : config_(config),
-      state_buffer_(AxisState{}),
-    command_buffer_(AxisCommand{}) {}
 
+// 构造函数：初始化轴配置、状态缓冲区和指令缓冲区
+ErobAxis::ErobAxis(const AxisConfig& config)
+        : config_(config),
+            state_buffer_(AxisState{}),
+            command_buffer_(AxisCommand{}) {}
+
+
+// 绑定电机信息到当前轴，返回是否绑定成功
 bool ErobAxis::bindMotor(const MotorIdentity& motor) {
     config_.bound_motor = motor;
     return config_.bound_motor.slave_index != 0;
 }
 
+
+// 获取当前轴的配置信息
 const AxisConfig& ErobAxis::config() const {
     return config_;
 }
 
+
+// 获取当前轴的最新状态（线程安全）
 AxisState ErobAxis::getState() const {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return state_buffer_.load();
 }
 
+
+// 获取最近一次错误信息
 std::string ErobAxis::lastError() const {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return last_error_;
 }
 
+
+// 使能当前轴，准备进入工作状态
 bool ErobAxis::enable() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
@@ -62,6 +79,8 @@ bool ErobAxis::enable() {
     return publishCommand(command);
 }
 
+
+// 关闭当前轴，停止所有运动并重置相关状态
 bool ErobAxis::disable() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
@@ -511,7 +530,8 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
             std::fabs(state.actual_velocity_deg_s) <= velocity_tolerance_deg_s;
         const bool reached_bit = (txpdo.statusword & 0x0400U) != 0;
         const bool settled_at_target =
-            pp_pulse_cycles_remaining_ == 0 && within_position_tolerance && within_velocity_tolerance;
+            !profile_transition_pending_ && pp_pulse_cycles_remaining_ == 0 &&
+            within_position_tolerance && within_velocity_tolerance;
         state.target_reached = (reached_bit && within_position_tolerance) || settled_at_target;
     } else {
         state.position_error_deg = state.target_angle_deg - state.actual_angle_deg;
@@ -531,7 +551,7 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
     } else if (state.position_mode_state == PositionModeState::kTimeout) {
     } else if (!state.enabled) {
         state.position_mode_state = PositionModeState::kWaitingEnable;
-    } else if (pp_pulse_cycles_remaining_ > 0) {
+    } else if (profile_transition_pending_ || pp_pulse_cycles_remaining_ > 0) {
         state.position_mode_state = PositionModeState::kSendingSetpoint;
     } else if (state.target_reached) {
         state.position_mode_state = PositionModeState::kTargetReached;
@@ -580,7 +600,7 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     const AxisCommand command = command_buffer_.load();
     constexpr uint16_t kPpControlwordBase = 0x000FU;
     constexpr uint16_t kPpControlwordNewSetpoint = 0x001FU;
-    constexpr int kPpPulseCycles = 2;
+    constexpr int kPpPulseCycles = 3;
     const bool control_transition_requested =
         command.quick_stop_requested ||
         command.disable_requested ||
@@ -654,13 +674,11 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
             pdo.controlword = static_cast<uint16_t>(kPpControlwordBase | pp_control_toggle_);
             profile_transition_pending_ = false;
             pp_pulse_cycles_remaining_ = kPpPulseCycles;
-            {
-                std::ostringstream stream;
-                stream << "PP base controlword=0x" << std::hex << pdo.controlword << std::dec
-                       << " pulse_cycles=" << pp_pulse_cycles_remaining_
-                       << " target_count=" << pdo.target_position;
-                LogAxisDebug(config_, stream.str());
-            }
+            std::ostringstream stream;
+            stream << "PP base controlword=0x" << std::hex << pdo.controlword << std::dec
+                   << " pulse_cycles=" << pp_pulse_cycles_remaining_
+                   << " target_count=" << pdo.target_position;
+            LogAxisDebug(config_, stream.str());
         } else if (pp_pulse_cycles_remaining_ > 0) {
             pdo.controlword = static_cast<uint16_t>(kPpControlwordNewSetpoint | pp_control_toggle_);
             if (pp_pulse_cycles_remaining_ == kPpPulseCycles) {
@@ -723,6 +741,7 @@ std::string ErobAxis::profilePositionDebugString() const {
            << " pending_velocity_deg_s=" << pending_profile_velocity_deg_s_
            << " state_controlword=0x" << std::hex << state.controlword << std::dec
            << " state_statusword=0x" << std::hex << state.statusword << std::dec
+            << " setpoint_ack=" << (((state.statusword & 0x1000U) != 0) ? "true" : "false")
            << " cmd_mode=" << MotionModeName(command.requested_mode)
            << " state_mode=" << MotionModeName(state.motion_mode);
     return stream.str();

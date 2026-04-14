@@ -1,5 +1,6 @@
-#include "erob/erob_arm_controller.h"
 
+// 机械臂控制器主实现文件，负责系统初始化、配置加载、轴管理、运动指令下发等核心流程。
+#include "erob/erob_arm_controller.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -14,24 +15,26 @@
 namespace erob {
 namespace {
 
+// 设置当前线程为实时优先级
 bool SetCurrentThreadRealtime(int priority) {
     sched_param param{};
     param.sched_priority = priority;
     return pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0;
 }
 
+// 设置当前线程绑定到指定CPU核
 bool SetCurrentThreadAffinity(int preferred_cpu) {
     const long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
     if (cpu_count <= 0) {
         return false;
     }
-
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(std::min<int>(preferred_cpu, static_cast<int>(cpu_count - 1)), &set);
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
 }
 
+// 判断轴配置是否已绑定电机身份
 bool HasConfiguredMotorIdentity(const AxisConfig& axis_config) {
     return !axis_config.bound_motor.serial_number.empty() ||
         (axis_config.bound_motor.eep_man != 0 &&
@@ -39,6 +42,7 @@ bool HasConfiguredMotorIdentity(const AxisConfig& axis_config) {
          axis_config.bound_motor.eep_rev != 0);
 }
 
+// 判断发现的电机身份是否与配置匹配
 bool MatchesConfiguredIdentity(const AxisConfig& axis_config, const MotorIdentity& motor) {
     if (!axis_config.bound_motor.serial_number.empty()) {
         return axis_config.bound_motor.serial_number == motor.serial_number;
@@ -53,6 +57,7 @@ bool MatchesConfiguredIdentity(const AxisConfig& axis_config, const MotorIdentit
     return false;
 }
 
+// 获取配置中电机身份的文本描述
 std::string ConfiguredIdentityText(const AxisConfig& axis_config) {
     if (!axis_config.bound_motor.serial_number.empty()) {
         return "serial " + axis_config.bound_motor.serial_number;
@@ -69,6 +74,7 @@ std::string ConfiguredIdentityText(const AxisConfig& axis_config) {
     return "unconfigured";
 }
 
+// 返回数值的符号（正1/负1/0）
 double Signum(double value) {
     if (value > 0.0) {
         return 1.0;
@@ -678,13 +684,16 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         angle_deg,
         velocity_deg_s);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto next_retrigger_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     auto next_debug_log = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    const double initial_angle_deg = ready_state.actual_angle_deg;
-    bool retriggered = false;
+    double last_progress_angle_deg = ready_state.actual_angle_deg;
+    auto last_progress_time = std::chrono::steady_clock::now();
+    int retrigger_count = 0;
+    constexpr int kMaxRetriggerCount = 6;
 
     while (std::chrono::steady_clock::now() < deadline) {
         const AxisState current_state = target_axis->getState();
+        const auto now = std::chrono::steady_clock::now();
         if (target_axis->profileRequestId() != request_id) {
             return true;
         }
@@ -705,37 +714,49 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         if (current_state.target_reached) {
             return true;
         }
-        if (!retriggered && std::chrono::steady_clock::now() >= retry_deadline) {
-            const bool still_not_moving =
-                std::fabs(current_state.actual_angle_deg - initial_angle_deg) <= 0.1 &&
-                std::fabs(current_state.actual_velocity_deg_s) <= 0.5;
-            if (still_not_moving) {
-                retriggered = true;
-                {
-                    std::ostringstream stream;
-                    stream << std::fixed << std::setprecision(2)
-                           << "moveTo retrigger"
-                           << " request_id=" << request_id
-                           << " actual_deg=" << current_state.actual_angle_deg
-                           << " target_deg=" << current_state.target_angle_deg
-                           << " error_deg=" << current_state.position_error_deg
-                           << " velocity_deg_s=" << current_state.actual_velocity_deg_s
-                           << " statusword=0x" << std::hex << current_state.statusword << std::dec
-                           << " | " << target_axis->profilePositionDebugString();
-                    LogControllerDebug(axis_id, stream.str());
-                }
-                if (!target_axis->retriggerProfilePositionTarget(request_id)) {
-                    setLastError("moveTo failed to retrigger profile position set-point");
-                    return false;
-                }
+        const bool has_progressed =
+            std::fabs(current_state.actual_angle_deg - last_progress_angle_deg) > 0.2 ||
+            std::fabs(current_state.actual_velocity_deg_s) > 0.8;
+        if (has_progressed) {
+            last_progress_angle_deg = current_state.actual_angle_deg;
+            last_progress_time = now;
+        }
+        const bool stalled_with_error =
+            std::fabs(current_state.position_error_deg) > 0.5 &&
+            std::fabs(current_state.actual_velocity_deg_s) <= 0.5 &&
+            now >= next_retrigger_deadline &&
+            (now - last_progress_time) >= std::chrono::milliseconds(180);
+        if (stalled_with_error && retrigger_count < kMaxRetriggerCount) {
+            ++retrigger_count;
+            next_retrigger_deadline = now + std::chrono::milliseconds(250);
+            last_progress_time = now;
+            last_progress_angle_deg = current_state.actual_angle_deg;
+            {
+                std::ostringstream stream;
+                stream << std::fixed << std::setprecision(2)
+                       << "moveTo retrigger"
+                       << " request_id=" << request_id
+                       << " retrigger_count=" << retrigger_count
+                       << " actual_deg=" << current_state.actual_angle_deg
+                       << " target_deg=" << current_state.target_angle_deg
+                       << " error_deg=" << current_state.position_error_deg
+                       << " velocity_deg_s=" << current_state.actual_velocity_deg_s
+                       << " statusword=0x" << std::hex << current_state.statusword << std::dec
+                       << " | " << target_axis->profilePositionDebugString();
+                LogControllerDebug(axis_id, stream.str());
+            }
+            if (!target_axis->retriggerProfilePositionTarget(request_id)) {
+                setLastError("moveTo failed to retrigger profile position set-point");
+                return false;
             }
         }
-        if (std::chrono::steady_clock::now() >= next_debug_log) {
-            next_debug_log = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        if (now >= next_debug_log) {
+            next_debug_log = now + std::chrono::milliseconds(250);
             std::ostringstream stream;
             stream << std::fixed << std::setprecision(2)
                    << "moveTo waiting"
                    << " request_id=" << request_id
+                   << " retrigger_count=" << retrigger_count
                    << " actual_deg=" << current_state.actual_angle_deg
                    << " target_deg=" << current_state.target_angle_deg
                    << " error_deg=" << current_state.position_error_deg

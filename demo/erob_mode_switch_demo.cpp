@@ -322,6 +322,32 @@ bool RunInterruptedProfilePositionScenario(
     return true;
 }
 
+bool WaitForProfilePositionSettle(
+    DemoContext* context,
+    const std::string& label,
+    int timeout_ms) {
+    if (context == nullptr || context->controller == nullptr) {
+        return false;
+    }
+
+    const auto deadline = SteadyClock::now() + std::chrono::milliseconds(timeout_ms);
+    while (SteadyClock::now() < deadline) {
+        const erob::AxisState state = context->controller->getAxisState(context->axis_id);
+        const bool stationary = std::fabs(state.actual_velocity_deg_s) <= 0.5;
+        const bool settled =
+            state.position_mode_state == erob::PositionModeState::kIdle ||
+            state.position_mode_state == erob::PositionModeState::kTargetReached ||
+            (stationary && std::fabs(state.position_error_deg) <= 0.2);
+        if (settled) {
+            return true;
+        }
+        SleepMs(20);
+    }
+
+    PrintAxisState(*context->controller, context->axis_id, label + "-pp-not-settled");
+    return false;
+}
+
 bool RunFollowScenario(
     DemoContext* context,
     int round_index,
@@ -333,60 +359,81 @@ bool RunFollowScenario(
     }
 
     const std::string label_prefix = "round-" + std::to_string(round_index) + "-follow";
+    if (!WaitForProfilePositionSettle(context, label_prefix, 1500)) {
+        const std::string error = "profile position did not settle before follow start";
+        std::cerr << '[' << label_prefix << "] settle wait failed: " << error << '\n';
+        RecordFailure(&context->stats, "follow_precheck", error);
+        return false;
+    }
+
     std::cout << '[' << label_prefix << "] starting follow mode" << '\n';
-    if (!context->controller->startFollowMode(context->axis_id)) {
-        const std::string error = context->controller->lastError();
-        std::cerr << '[' << label_prefix << "] start failed: " << error << '\n';
-        PrintAxisState(*context->controller, context->axis_id, label_prefix + "-start-failed");
-        RecordFailure(&context->stats, "follow_start", error);
-        return false;
-    }
+    constexpr int kFollowStartAttempts = 5;
+    for (int attempt = 1; attempt <= kFollowStartAttempts; ++attempt) {
+        if (context->controller->startFollowMode(context->axis_id)) {
+            SleepMs(std::max(10, update_period_ms));
+            PrintAxisState(*context->controller, context->axis_id, label_prefix + "-started");
 
-    SleepMs(std::max(10, update_period_ms));
-    PrintAxisState(*context->controller, context->axis_id, label_prefix + "-started");
-
-    double last_target_deg = context->controller->getAxisState(context->axis_id).actual_angle_deg;
-    for (std::size_t index = 0; index < targets_deg.size(); ++index) {
-        const double target_deg = targets_deg[index];
-        std::cout << '[' << label_prefix << "] target[" << index << "]=" << target_deg << '\n';
-        const int steps = std::max(1, segment_duration_ms / std::max(1, update_period_ms));
-        for (int step = 1; step <= steps; ++step) {
-            if (StopRequested()) {
-                context->controller->stopFollowMode(context->axis_id);
-                return false;
+            double last_target_deg = context->controller->getAxisState(context->axis_id).actual_angle_deg;
+            for (std::size_t index = 0; index < targets_deg.size(); ++index) {
+                const double target_deg = targets_deg[index];
+                std::cout << '[' << label_prefix << "] target[" << index << "]=" << target_deg << '\n';
+                const int steps = std::max(1, segment_duration_ms / std::max(1, update_period_ms));
+                for (int step = 1; step <= steps; ++step) {
+                    if (StopRequested()) {
+                        context->controller->stopFollowMode(context->axis_id);
+                        return false;
+                    }
+                    const double ratio = static_cast<double>(step) / static_cast<double>(steps);
+                    const double streamed_target_deg =
+                        last_target_deg + ratio * (target_deg - last_target_deg);
+                    if (!context->controller->updateFollowTarget(context->axis_id, streamed_target_deg)) {
+                        const std::string error = context->controller->lastError();
+                        std::cerr << '[' << label_prefix << "] update failed: " << error << '\n';
+                        PrintAxisState(*context->controller, context->axis_id, label_prefix + "-update-failed");
+                        RecordFailure(&context->stats, "follow_update", error);
+                        context->controller->stopFollowMode(context->axis_id);
+                        return false;
+                    }
+                    SleepMs(update_period_ms);
+                }
+                PrintAxisState(
+                    *context->controller,
+                    context->axis_id,
+                    label_prefix + "-running-" + std::to_string(static_cast<unsigned long long>(index)));
+                last_target_deg = target_deg;
             }
-            const double ratio = static_cast<double>(step) / static_cast<double>(steps);
-            const double streamed_target_deg =
-                last_target_deg + ratio * (target_deg - last_target_deg);
-            if (!context->controller->updateFollowTarget(context->axis_id, streamed_target_deg)) {
+
+            if (!context->controller->stopFollowMode(context->axis_id)) {
                 const std::string error = context->controller->lastError();
-                std::cerr << '[' << label_prefix << "] update failed: " << error << '\n';
-                PrintAxisState(*context->controller, context->axis_id, label_prefix + "-update-failed");
-                RecordFailure(&context->stats, "follow_update", error);
-                context->controller->stopFollowMode(context->axis_id);
+                std::cerr << '[' << label_prefix << "] stop failed: " << error << '\n';
+                PrintAxisState(*context->controller, context->axis_id, label_prefix + "-stop-failed");
+                RecordFailure(&context->stats, "follow_stop", error);
                 return false;
             }
-            SleepMs(update_period_ms);
+
+            SleepMs(400);
+            PrintAxisState(*context->controller, context->axis_id, label_prefix + "-stopped");
+            ++context->completed_scenarios;
+            return true;
         }
-        PrintAxisState(
-            *context->controller,
-            context->axis_id,
-            label_prefix + "-running-" + std::to_string(static_cast<unsigned long long>(index)));
-        last_target_deg = target_deg;
-    }
 
-    if (!context->controller->stopFollowMode(context->axis_id)) {
         const std::string error = context->controller->lastError();
-        std::cerr << '[' << label_prefix << "] stop failed: " << error << '\n';
-        PrintAxisState(*context->controller, context->axis_id, label_prefix + "-stop-failed");
-        RecordFailure(&context->stats, "follow_stop", error);
-        return false;
+        if (error.find("axis is still moving in profile position mode") == std::string::npos) {
+            std::cerr << '[' << label_prefix << "] start failed: " << error << '\n';
+            PrintAxisState(*context->controller, context->axis_id, label_prefix + "-start-failed");
+            RecordFailure(&context->stats, "follow_start", error);
+            return false;
+        }
+
+        std::cout << '[' << label_prefix << "] start delayed by PP settle, attempt=" << attempt << '\n';
+        SleepMs(120);
     }
 
-    SleepMs(400);
-    PrintAxisState(*context->controller, context->axis_id, label_prefix + "-stopped");
-    ++context->completed_scenarios;
-    return true;
+    const std::string error = "follow start still blocked after retries";
+    std::cerr << '[' << label_prefix << "] start failed: " << error << '\n';
+    PrintAxisState(*context->controller, context->axis_id, label_prefix + "-start-failed");
+    RecordFailure(&context->stats, "follow_start", error);
+    return false;
 }
 
 bool EnsureAxisReady(DemoContext* context, const std::string& stage) {
