@@ -191,9 +191,6 @@ struct AxisState {
     int16_t actual_torque = 0;
     double actual_angle_deg = 0.0;
     double actual_velocity_deg_s = 0.0;
-    double follow_filtered_target_deg = 0.0;
-    double follow_planner_velocity_deg_s = 0.0;
-    double follow_output_velocity_deg_s = 0.0;
     double target_angle_deg = 0.0;
     double position_error_deg = 0.0;
     bool target_reached = false;

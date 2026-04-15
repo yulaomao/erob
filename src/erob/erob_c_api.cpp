@@ -208,9 +208,6 @@ void FillAxisStateValue(const erob::AxisState& state, ErobAxisStateValue* out_st
     out_state->actual_torque = state.actual_torque;
     out_state->actual_angle_deg = state.actual_angle_deg;
     out_state->actual_velocity_deg_s = state.actual_velocity_deg_s;
-    out_state->follow_filtered_target_deg = state.follow_filtered_target_deg;
-    out_state->follow_planner_velocity_deg_s = state.follow_planner_velocity_deg_s;
-    out_state->follow_output_velocity_deg_s = state.follow_output_velocity_deg_s;
     out_state->target_angle_deg = state.target_angle_deg;
     out_state->position_error_deg = state.position_error_deg;
     out_state->target_reached = state.target_reached ? 1 : 0;

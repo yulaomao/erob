@@ -357,7 +357,7 @@ struct FollowParams {
     double max_velocity_deg_s = 300.0;
     double max_accel_deg_s2 = 800.0;
     double max_decel_deg_s2 = 800.0;
-    double target_filter_alpha = 0.4;
+    double target_filter_time_constant_ms = 32.6;
     double watchdog_timeout_ms = 50.0;
     double position_limit_margin_deg = 5.0;
 };
@@ -1145,7 +1145,7 @@ axes:
       max_velocity_deg_s: 250.0
       max_accel_deg_s2: 600.0
       max_decel_deg_s2: 600.0
-      target_filter_alpha: 0.4
+      target_filter_time_constant_ms: 32.6
       watchdog_timeout_ms: 50.0
       position_limit_margin_deg: 5.0
 
@@ -1166,7 +1166,7 @@ axes:
       max_velocity_deg_s: 220.0
       max_accel_deg_s2: 550.0
       max_decel_deg_s2: 550.0
-      target_filter_alpha: 0.4
+      target_filter_time_constant_ms: 32.6
       watchdog_timeout_ms: 50.0
       position_limit_margin_deg: 5.0
 
@@ -1187,7 +1187,7 @@ axes:
       max_velocity_deg_s: 220.0
       max_accel_deg_s2: 550.0
       max_decel_deg_s2: 550.0
-      target_filter_alpha: 0.4
+      target_filter_time_constant_ms: 32.6
       watchdog_timeout_ms: 50.0
       position_limit_margin_deg: 5.0
 ```
