@@ -29,6 +29,7 @@ public:
 
     std::vector<AdapterInfo> scanAdapters();
     std::vector<MotorIdentity> scanMotorsOnAllAdapters();
+    bool scanAndInitialize();
     std::vector<MotorIdentity> rescan();
     std::vector<MotorIdentity> rescanCurrentAdapter();
     std::vector<MotorIdentity> rescanAllAdapters();
@@ -43,7 +44,13 @@ public:
     bool enableAll();
     bool disableAll();
 
-    bool moveTo(int axis_id, double angle_deg, double velocity_deg_s);
+    MoveCommandStatus issueMoveTo(int axis_id, double angle_deg, double velocity_deg_s);
+    MoveCommandStatus moveTo(int axis_id, double angle_deg, double velocity_deg_s);
+    bool isAxisBusy(int axis_id) const;
+    MoveCommandStatus moveGroup(
+        const std::vector<AxisMoveRequest>& requests,
+        bool wait_all,
+        bool strict_mode = true);
     bool startFollowMode(int axis_id);
     bool updateFollowTarget(int axis_id, double angle_deg);
     bool stopFollowMode(int axis_id);
@@ -78,12 +85,44 @@ private:
         const std::string& adapter_name,
         std::vector<MotorIdentity>* motors,
         std::string* detail);
+    bool validateProfilePositionMove(
+        int axis_id,
+        double angle_deg,
+        double velocity_deg_s,
+        bool allow_follow_transition,
+        bool* needs_follow_stop,
+        int* timeout_ms);
+    MoveCommandStatus issueProfilePositionMove(
+        int axis_id,
+        double angle_deg,
+        double velocity_deg_s,
+        bool allow_follow_transition,
+        uint64_t* request_id,
+        int* timeout_ms);
+    MoveCommandStatus issuePreparedProfilePositionMove(
+        int axis_id,
+        double angle_deg,
+        double velocity_deg_s,
+        uint64_t* request_id,
+        int* timeout_ms);
+    MoveCommandStatus waitForProfilePositionMove(
+        int axis_id,
+        uint64_t request_id,
+        int timeout_ms);
+    MoveCommandStatus waitForProfilePositionGroup(
+        const std::vector<int>& axis_ids,
+        const std::vector<uint64_t>& request_ids,
+        int timeout_ms);
     bool applyProfilePositionParams(uint16_t slave_index, const ProfilePositionParams& params);
     bool autoBindDiscoveredMotors(const std::vector<MotorIdentity>& motors);
     void rebuildAxesFromDiscoveredMotors(const std::vector<MotorIdentity>& motors);
     void auditBindingState(const std::vector<MotorIdentity>& motors);
     void syncAxisControlRates();
     std::string discoveryCachePath() const;
+    MoveCommandStatus rejectMoveCommand(const std::string& message);
+    MoveCommandStatus interruptMoveCommand(const std::string& message);
+    MoveCommandStatus timeoutMoveCommand(const std::string& message);
+    MoveCommandStatus supersedeMoveCommand(const std::string& message);
     void setLastError(const std::string& message);
 
     ConfigManager config_manager_;

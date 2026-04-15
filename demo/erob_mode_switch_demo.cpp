@@ -165,6 +165,13 @@ bool StopRequested() {
     return g_stop_requested.load(std::memory_order_acquire);
 }
 
+bool IsSuccessfulMoveStatus(erob::MoveCommandStatus status, bool blocking_call) {
+    if (blocking_call) {
+        return status == erob::MoveCommandStatus::kCompleted;
+    }
+    return status == erob::MoveCommandStatus::kIssued;
+}
+
 void RecordFailure(FailureStats* stats, const std::string& command_type, const std::string& error) {
     if (stats == nullptr) {
         return;
@@ -263,9 +270,13 @@ bool RunMoveTo(
 
     std::cout << '[' << label << "] moveTo target_deg=" << target_deg
               << ", velocity_deg_s=" << velocity_deg_s << '\n';
-    if (!context->controller->moveTo(context->axis_id, target_deg, velocity_deg_s)) {
+    const erob::MoveCommandStatus move_status =
+        context->controller->moveTo(context->axis_id, target_deg, velocity_deg_s);
+    if (!IsSuccessfulMoveStatus(move_status, true)) {
         const std::string error = context->controller->lastError();
-        std::cerr << '[' << label << "] moveTo failed: " << error << '\n';
+        std::cerr << '[' << label << "] moveTo failed: status="
+                  << erob::MoveCommandStatusName(move_status)
+                  << ", error=" << error << '\n';
         PrintAxisState(*context->controller, context->axis_id, label + "-failed");
         RecordFailure(&context->stats, command_type, error);
         return false;
@@ -299,18 +310,26 @@ bool RunInterruptedProfilePositionScenario(
     });
 
     SleepMs(180);
-    bool second_ok = context->controller->moveTo(context->axis_id, second_target_deg, velocity_deg_s);
+    const erob::MoveCommandStatus second_status =
+        context->controller->moveTo(context->axis_id, second_target_deg, velocity_deg_s);
     const std::string second_error = context->controller->lastError();
-    const bool first_ok = first_move.get();
+    const erob::MoveCommandStatus first_status = first_move.get();
     const std::string first_error = context->controller->lastError();
 
+    const bool first_ok =
+        first_status == erob::MoveCommandStatus::kCompleted ||
+        first_status == erob::MoveCommandStatus::kSuperseded;
     if (!first_ok) {
-        std::cerr << '[' << label_prefix << "] first move failed: " << first_error << '\n';
+        std::cerr << '[' << label_prefix << "] first move failed: status="
+                  << erob::MoveCommandStatusName(first_status)
+                  << ", error=" << first_error << '\n';
         PrintAxisState(*context->controller, context->axis_id, label_prefix + "-first-failed");
         RecordFailure(&context->stats, "move_to_interrupt_primary", first_error);
     }
-    if (!second_ok) {
-        std::cerr << '[' << label_prefix << "] second move failed: " << second_error << '\n';
+    if (second_status != erob::MoveCommandStatus::kCompleted) {
+        std::cerr << '[' << label_prefix << "] second move failed: status="
+                  << erob::MoveCommandStatusName(second_status)
+                  << ", error=" << second_error << '\n';
         PrintAxisState(*context->controller, context->axis_id, label_prefix + "-second-failed");
         RecordFailure(&context->stats, "move_to_interrupt_secondary", second_error);
         return false;

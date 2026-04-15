@@ -5,8 +5,9 @@ import json
 import os
 import threading
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 class ControllerError(RuntimeError):
@@ -101,6 +102,30 @@ class AxisState:
     cia402_state_name: str
     position_mode_name: str
     follow_mode_name: str
+
+
+@dataclass(slots=True)
+class AxisMoveRequest:
+    axis_id: int
+    angle_deg: float
+    velocity_deg_s: float
+
+
+class MoveCommandStatus(IntEnum):
+    COMPLETED = 0
+    ISSUED = 1
+    SUPERSEDED = 2
+    REJECTED = 3
+    TIMED_OUT = 4
+    INTERRUPTED = 5
+
+
+class _AxisMoveRequestStruct(ctypes.Structure):
+    _fields_ = [
+        ("axis_id", ctypes.c_int),
+        ("angle_deg", ctypes.c_double),
+        ("velocity_deg_s", ctypes.c_double),
+    ]
 
 
 def _decode_c_string(raw: bytes | None) -> str:
@@ -221,6 +246,13 @@ class ErobController:
         with self._lock:
             self._require_bool(self._lib.erob_controller_shutdown(self._handle), "shutdown")
 
+    def scan_and_initialize(self) -> None:
+        with self._lock:
+            self._require_bool(
+                self._lib.erob_controller_scan_and_initialize(self._handle),
+                "scan_and_initialize",
+            )
+
     def recover_bus_and_rescan(self) -> list[dict[str, Any]]:
         with self._lock:
             motors = self._json_call(self._lib.erob_controller_recover_bus_and_rescan_json)
@@ -256,10 +288,40 @@ class ErobController:
         with self._lock:
             self._require_bool(self._lib.erob_controller_quick_stop_all(self._handle), "quick_stop_all")
 
-    def move_to(self, axis_id: int, angle_deg: float, velocity_deg_s: float) -> None:
-        self._require_bool(
-            self._lib.erob_controller_move_to(self._handle, axis_id, angle_deg, velocity_deg_s),
-            "move_to",
+    def move_to(self, axis_id: int, angle_deg: float, velocity_deg_s: float) -> MoveCommandStatus:
+        return self._decode_move_status(
+            self._lib.erob_controller_move_to(self._handle, axis_id, angle_deg, velocity_deg_s)
+        )
+
+    def issue_move_to(self, axis_id: int, angle_deg: float, velocity_deg_s: float) -> MoveCommandStatus:
+        return self._decode_move_status(
+            self._lib.erob_controller_issue_move_to(self._handle, axis_id, angle_deg, velocity_deg_s)
+        )
+
+    def is_axis_busy(self, axis_id: int) -> bool:
+        return bool(self._lib.erob_controller_is_axis_busy(self._handle, axis_id))
+
+    def move_group(
+        self,
+        commands: Sequence[AxisMoveRequest | tuple[int, float, float] | dict[str, Any]],
+        wait_all: bool = True,
+        strict: bool = True,
+    ) -> MoveCommandStatus:
+        normalized = self._normalize_move_requests(commands)
+        raw_requests = (_AxisMoveRequestStruct * len(normalized))()
+        for index, request in enumerate(normalized):
+            raw_requests[index].axis_id = request.axis_id
+            raw_requests[index].angle_deg = request.angle_deg
+            raw_requests[index].velocity_deg_s = request.velocity_deg_s
+        requests_ptr = raw_requests if normalized else None
+        return self._decode_move_status(
+            self._lib.erob_controller_move_group(
+                self._handle,
+                requests_ptr,
+                len(normalized),
+                1 if wait_all else 0,
+                1 if strict else 0,
+            )
         )
 
     def start_follow(self, axis_id: int) -> None:
@@ -316,7 +378,11 @@ class ErobController:
 
     def scan_motors(self) -> list[dict[str, Any]]:
         with self._lock:
-            motors = self._json_call(self._lib.erob_controller_scan_motors_json)
+            self._require_bool(
+                self._lib.erob_controller_scan_and_initialize(self._handle),
+                "scan_and_initialize",
+            )
+            motors = self._json_call(self._lib.erob_controller_get_discovered_motors_json)
             self._metadata = self._read_metadata()
             self._cached_states = []
             return motors
@@ -368,6 +434,7 @@ class ErobController:
         bool_calls = [
             "erob_controller_initialize",
             "erob_controller_shutdown",
+            "erob_controller_scan_and_initialize",
             "erob_controller_enable_all",
             "erob_controller_disable_all",
             "erob_controller_quick_stop_all",
@@ -382,12 +449,21 @@ class ErobController:
             "erob_controller_disable_axis",
             "erob_controller_reset_fault",
             "erob_controller_quick_stop_axis",
+            "erob_controller_is_axis_busy",
             "erob_controller_start_follow",
             "erob_controller_stop_follow",
         ]
         for name in one_axis_calls:
             getattr(self._lib, name).argtypes = [ctypes.c_void_p, ctypes.c_int]
             getattr(self._lib, name).restype = ctypes.c_int
+
+        self._lib.erob_controller_issue_move_to.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.c_double,
+        ]
+        self._lib.erob_controller_issue_move_to.restype = ctypes.c_int
 
         self._lib.erob_controller_move_to.argtypes = [
             ctypes.c_void_p,
@@ -396,6 +472,15 @@ class ErobController:
             ctypes.c_double,
         ]
         self._lib.erob_controller_move_to.restype = ctypes.c_int
+
+        self._lib.erob_controller_move_group.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_AxisMoveRequestStruct),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self._lib.erob_controller_move_group.restype = ctypes.c_int
 
         self._lib.erob_controller_update_follow_target.argtypes = [
             ctypes.c_void_p,
@@ -511,3 +596,39 @@ class ErobController:
             return
         error_message = self.last_error() or f"{action} 失败"
         raise ControllerError(error_message)
+
+    def _decode_move_status(self, raw_status: int) -> MoveCommandStatus:
+        try:
+            return MoveCommandStatus(raw_status)
+        except ValueError as error:
+            raise ControllerError(f"未知运动状态码: {raw_status}") from error
+
+    def _normalize_move_requests(
+        self,
+        commands: Sequence[AxisMoveRequest | tuple[int, float, float] | dict[str, Any]],
+    ) -> list[AxisMoveRequest]:
+        normalized: list[AxisMoveRequest] = []
+        for command in commands:
+            if isinstance(command, AxisMoveRequest):
+                normalized.append(command)
+                continue
+            if isinstance(command, tuple) and len(command) == 3:
+                normalized.append(
+                    AxisMoveRequest(
+                        axis_id=int(command[0]),
+                        angle_deg=float(command[1]),
+                        velocity_deg_s=float(command[2]),
+                    )
+                )
+                continue
+            if isinstance(command, dict):
+                normalized.append(
+                    AxisMoveRequest(
+                        axis_id=int(command["axis_id"]),
+                        angle_deg=float(command["angle_deg"]),
+                        velocity_deg_s=float(command["velocity_deg_s"]),
+                    )
+                )
+                continue
+            raise ControllerError(f"不支持的 move_group 命令格式: {command!r}")
+        return normalized

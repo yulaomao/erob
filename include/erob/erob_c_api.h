@@ -67,11 +67,27 @@ typedef struct ErobAxisStateValue {
     char follow_mode_name[EROB_TEXT_MEDIUM];
 } ErobAxisStateValue;
 
+typedef struct ErobAxisMoveRequest {
+    int axis_id;
+    double angle_deg;
+    double velocity_deg_s;
+} ErobAxisMoveRequest;
+
+typedef enum ErobMoveCommandStatus {
+    EROB_MOVE_STATUS_COMPLETED = 0,
+    EROB_MOVE_STATUS_ISSUED = 1,
+    EROB_MOVE_STATUS_SUPERSEDED = 2,
+    EROB_MOVE_STATUS_REJECTED = 3,
+    EROB_MOVE_STATUS_TIMED_OUT = 4,
+    EROB_MOVE_STATUS_INTERRUPTED = 5,
+} ErobMoveCommandStatus;
+
 EROB_C_API_EXPORT ErobControllerHandle* erob_controller_create(const char* config_path);
 EROB_C_API_EXPORT void erob_controller_destroy(ErobControllerHandle* handle);
 
 EROB_C_API_EXPORT int erob_controller_initialize(ErobControllerHandle* handle);
 EROB_C_API_EXPORT int erob_controller_shutdown(ErobControllerHandle* handle);
+EROB_C_API_EXPORT int erob_controller_scan_and_initialize(ErobControllerHandle* handle);
 EROB_C_API_EXPORT const char* erob_controller_recover_bus_and_rescan_json(ErobControllerHandle* handle);
 EROB_C_API_EXPORT int erob_controller_enable_axis(ErobControllerHandle* handle, int axis_id);
 EROB_C_API_EXPORT int erob_controller_disable_axis(ErobControllerHandle* handle, int axis_id);
@@ -80,11 +96,23 @@ EROB_C_API_EXPORT int erob_controller_enable_all(ErobControllerHandle* handle);
 EROB_C_API_EXPORT int erob_controller_disable_all(ErobControllerHandle* handle);
 EROB_C_API_EXPORT int erob_controller_quick_stop_axis(ErobControllerHandle* handle, int axis_id);
 EROB_C_API_EXPORT int erob_controller_quick_stop_all(ErobControllerHandle* handle);
-EROB_C_API_EXPORT int erob_controller_move_to(
+EROB_C_API_EXPORT ErobMoveCommandStatus erob_controller_issue_move_to(
     ErobControllerHandle* handle,
     int axis_id,
     double angle_deg,
     double velocity_deg_s);
+EROB_C_API_EXPORT ErobMoveCommandStatus erob_controller_move_to(
+    ErobControllerHandle* handle,
+    int axis_id,
+    double angle_deg,
+    double velocity_deg_s);
+EROB_C_API_EXPORT int erob_controller_is_axis_busy(ErobControllerHandle* handle, int axis_id);
+EROB_C_API_EXPORT ErobMoveCommandStatus erob_controller_move_group(
+    ErobControllerHandle* handle,
+    const ErobAxisMoveRequest* requests,
+    int request_count,
+    int wait_all,
+    int strict_mode);
 EROB_C_API_EXPORT int erob_controller_start_follow(ErobControllerHandle* handle, int axis_id);
 EROB_C_API_EXPORT int erob_controller_update_follow_target(
     ErobControllerHandle* handle,

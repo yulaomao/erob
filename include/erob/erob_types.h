@@ -128,6 +128,40 @@ struct ProfilePositionParams {
     uint32_t profile_deceleration = 0;
 };
 
+struct AxisMoveRequest {
+    int axis_id = -1;
+    double angle_deg = 0.0;
+    double velocity_deg_s = 0.0;
+};
+
+enum class MoveCommandStatus {
+    kCompleted = 0,
+    kIssued,
+    kSuperseded,
+    kRejected,
+    kTimedOut,
+    kInterrupted,
+};
+
+inline const char* MoveCommandStatusName(MoveCommandStatus status) {
+    switch (status) {
+    case MoveCommandStatus::kCompleted:
+        return "completed";
+    case MoveCommandStatus::kIssued:
+        return "issued";
+    case MoveCommandStatus::kSuperseded:
+        return "superseded";
+    case MoveCommandStatus::kRejected:
+        return "rejected";
+    case MoveCommandStatus::kTimedOut:
+        return "timed_out";
+    case MoveCommandStatus::kInterrupted:
+        return "interrupted";
+    default:
+        return "unknown";
+    }
+}
+
 struct AxisCommand {
     MotionMode requested_mode = MotionMode::kNone;
     double target_angle_deg = 0.0;

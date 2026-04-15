@@ -210,8 +210,10 @@ int main(int argc, char** argv) {
             controller.shutdown();
             return 1;
         }
-        if (!controller.moveTo(axis_id, angle_deg, velocity_deg_s)) {
-            std::cerr << "move failed: " << controller.lastError() << '\n';
+        const erob::MoveCommandStatus move_status = controller.moveTo(axis_id, angle_deg, velocity_deg_s);
+        if (move_status != erob::MoveCommandStatus::kCompleted) {
+            std::cerr << "move failed: status=" << erob::MoveCommandStatusName(move_status)
+                      << ", error=" << controller.lastError() << '\n';
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
         PrintStates(controller);

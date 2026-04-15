@@ -177,8 +177,28 @@ bool IsProfilePositionStillSettling(const AxisConfig& axis_config, const AxisSta
 
 bool IsFollowModeBusy(const AxisState& state, const ErobAxis* axis_ptr) {
     return axis_ptr->isFollowActive() ||
-        state.follow_mode_state != FollowModeState::kIdle ||
-        state.motion_mode == MotionMode::kCyclicSyncVelocity;
+        state.follow_mode_state != FollowModeState::kIdle;
+}
+
+bool IsAxisBusyState(const AxisState& state, const ErobAxis* axis_ptr) {
+    if (axis_ptr == nullptr) {
+        return false;
+    }
+    if (axis_ptr->isFollowActive() || state.follow_mode_state != FollowModeState::kIdle) {
+        return true;
+    }
+    switch (state.position_mode_state) {
+    case PositionModeState::kWaitingEnable:
+    case PositionModeState::kSendingSetpoint:
+    case PositionModeState::kMoving:
+    case PositionModeState::kTimeout:
+        return true;
+    case PositionModeState::kIdle:
+    case PositionModeState::kTargetReached:
+    case PositionModeState::kFault:
+    default:
+        return false;
+    }
 }
 
 bool IsSyncRelatedOperationalFailure(const std::string& error) {
@@ -371,6 +391,25 @@ std::vector<AdapterInfo> ErobArmController::scanAdapters() {
 
 std::vector<MotorIdentity> ErobArmController::scanMotorsOnAllAdapters() {
     return master_.scanMotorsOnAllAdapters();
+}
+
+bool ErobArmController::scanAndInitialize() {
+    const std::vector<MotorIdentity> motors = scanAndBind();
+    if (motors.empty()) {
+        if (lastError().empty()) {
+            setLastError("scanAndInitialize discovered no motors");
+        }
+        return false;
+    }
+
+    if (initialize()) {
+        return true;
+    }
+
+    const std::string init_error = lastError();
+    shutdown();
+    setLastError("scan succeeded but auto initialize failed | " + init_error);
+    return false;
 }
 
 std::vector<MotorIdentity> ErobArmController::scanAndBind() {
@@ -759,7 +798,175 @@ bool ErobArmController::disableAll() {
     return ok;
 }
 
-bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_deg_s) {
+MoveCommandStatus ErobArmController::issueMoveTo(int axis_id, double angle_deg, double velocity_deg_s) {
+    uint64_t request_id = 0;
+    int timeout_ms = 0;
+    return issueProfilePositionMove(
+        axis_id,
+        angle_deg,
+        velocity_deg_s,
+        false,
+        &request_id,
+        &timeout_ms);
+}
+
+MoveCommandStatus ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_deg_s) {
+    uint64_t request_id = 0;
+    int timeout_ms = 0;
+    const MoveCommandStatus issue_status = issueProfilePositionMove(
+            axis_id,
+            angle_deg,
+            velocity_deg_s,
+            true,
+            &request_id,
+            &timeout_ms);
+    if (issue_status != MoveCommandStatus::kIssued) {
+        return issue_status;
+    }
+    return waitForProfilePositionMove(axis_id, request_id, timeout_ms);
+}
+
+bool ErobArmController::isAxisBusy(int axis_id) const {
+    const ErobAxis* target_axis = axis(axis_id);
+    if (target_axis == nullptr || !target_axis->hasBoundMotor()) {
+        return false;
+    }
+    return IsAxisBusyState(target_axis->getState(), target_axis);
+}
+
+MoveCommandStatus ErobArmController::moveGroup(
+    const std::vector<AxisMoveRequest>& requests,
+    bool wait_all,
+    bool strict_mode) {
+    if (requests.empty()) {
+        return wait_all ? MoveCommandStatus::kCompleted : MoveCommandStatus::kIssued;
+    }
+
+    std::vector<bool> seen_axes(axes_.size(), false);
+    std::vector<int> needs_follow_stop(requests.size(), 0);
+    std::vector<int> timeouts_ms(requests.size(), 0);
+    for (const AxisMoveRequest& request : requests) {
+        if (request.axis_id < 0 || request.axis_id >= static_cast<int>(axes_.size())) {
+            return rejectMoveCommand("moveGroup axis id out of range");
+        }
+        ErobAxis* target_axis = axis(request.axis_id);
+        if (target_axis == nullptr || !target_axis->hasBoundMotor()) {
+            return rejectMoveCommand("moveGroup contains an unbound axis");
+        }
+        if (seen_axes[request.axis_id]) {
+            return rejectMoveCommand("moveGroup contains duplicate axis ids");
+        }
+        seen_axes[request.axis_id] = true;
+    }
+
+    if (strict_mode) {
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            bool axis_needs_follow_stop = false;
+            if (!validateProfilePositionMove(
+                    requests[index].axis_id,
+                    requests[index].angle_deg,
+                    requests[index].velocity_deg_s,
+                    true,
+                    &axis_needs_follow_stop,
+                    &timeouts_ms[index])) {
+                std::ostringstream stream;
+                stream << "moveGroup strict precheck failed on axis " << requests[index].axis_id;
+                const std::string error = lastError();
+                if (!error.empty()) {
+                    stream << ": " << error;
+                }
+                return rejectMoveCommand(stream.str());
+            }
+            needs_follow_stop[index] = axis_needs_follow_stop ? 1 : 0;
+        }
+
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            if (needs_follow_stop[index] == 0) {
+                continue;
+            }
+            if (!stopFollowMode(requests[index].axis_id)) {
+                std::ostringstream stream;
+                stream << "moveGroup strict follow stop failed on axis " << requests[index].axis_id;
+                const std::string error = lastError();
+                if (!error.empty()) {
+                    stream << ": " << error;
+                }
+                return rejectMoveCommand(stream.str());
+            }
+        }
+
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            bool follow_stop_not_needed = false;
+            if (!validateProfilePositionMove(
+                    requests[index].axis_id,
+                    requests[index].angle_deg,
+                    requests[index].velocity_deg_s,
+                    false,
+                    &follow_stop_not_needed,
+                    &timeouts_ms[index])) {
+                std::ostringstream stream;
+                stream << "moveGroup strict recheck failed on axis " << requests[index].axis_id;
+                const std::string error = lastError();
+                if (!error.empty()) {
+                    stream << ": " << error;
+                }
+                return rejectMoveCommand(stream.str());
+            }
+        }
+    }
+
+    std::vector<int> axis_ids;
+    std::vector<uint64_t> request_ids;
+    int longest_timeout_ms = 0;
+    axis_ids.reserve(requests.size());
+    request_ids.reserve(requests.size());
+
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        const AxisMoveRequest& request = requests[index];
+        uint64_t request_id = 0;
+        int timeout_ms = 0;
+        const MoveCommandStatus issue_status = strict_mode
+            ? issuePreparedProfilePositionMove(
+                request.axis_id,
+                request.angle_deg,
+                request.velocity_deg_s,
+                &request_id,
+                &timeout_ms)
+            : issueProfilePositionMove(
+                request.axis_id,
+                request.angle_deg,
+                request.velocity_deg_s,
+                true,
+                &request_id,
+                &timeout_ms);
+        if (issue_status != MoveCommandStatus::kIssued) {
+            std::ostringstream stream;
+            stream << "moveGroup issue failed on axis " << request.axis_id;
+            const std::string error = lastError();
+            if (!error.empty()) {
+                stream << ": " << error;
+            }
+            setLastError(stream.str());
+            return issue_status;
+        }
+        axis_ids.push_back(request.axis_id);
+        request_ids.push_back(request_id);
+        longest_timeout_ms = std::max(longest_timeout_ms, strict_mode ? timeouts_ms[index] : timeout_ms);
+    }
+
+    if (!wait_all) {
+        return MoveCommandStatus::kIssued;
+    }
+    return waitForProfilePositionGroup(axis_ids, request_ids, longest_timeout_ms);
+}
+
+bool ErobArmController::validateProfilePositionMove(
+    int axis_id,
+    double angle_deg,
+    double velocity_deg_s,
+    bool allow_follow_transition,
+    bool* needs_follow_stop,
+    int* timeout_ms) {
     ErobAxis* target_axis = axis(axis_id);
     if (target_axis == nullptr) {
         setLastError("axis id out of range");
@@ -779,55 +986,76 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         setLastError("axis must be enabled before moveTo");
         return false;
     }
+    if (needs_follow_stop != nullptr) {
+        *needs_follow_stop = false;
+    }
     if (IsFollowModeBusy(state, target_axis)) {
+        if (!allow_follow_transition) {
+            setLastError("axis is in follow mode; stop follow before issueMoveTo");
+            return false;
+        }
         if (std::fabs(state.actual_velocity_deg_s) > ModeSwitchVelocityToleranceDegS(target_axis->config())) {
             setLastError("axis is in follow mode and still moving; wait until velocity is near zero before moveTo");
             return false;
         }
-        if (!stopFollowMode(axis_id)) {
-            if (lastError().empty()) {
-                setLastError("failed to stop follow mode before moveTo");
-            }
-            return false;
+        if (needs_follow_stop != nullptr) {
+            *needs_follow_stop = true;
         }
     }
 
+    const AxisConfig& axis_config = target_axis->config();
+    const int local_timeout_ms = EstimateProfilePositionTimeoutMs(
+        axis_config,
+        state,
+        angle_deg,
+        velocity_deg_s);
+    if (timeout_ms != nullptr) {
+        *timeout_ms = local_timeout_ms;
+    }
+    return true;
+}
+
+MoveCommandStatus ErobArmController::issuePreparedProfilePositionMove(
+    int axis_id,
+    double angle_deg,
+    double velocity_deg_s,
+    uint64_t* request_id,
+    int* timeout_ms) {
+    ErobAxis* target_axis = axis(axis_id);
+    if (target_axis == nullptr) {
+        return rejectMoveCommand("axis id out of range");
+    }
     const AxisState ready_state = target_axis->getState();
     if (!ready_state.online) {
-        setLastError("axis went offline before moveTo");
-        return false;
+        return rejectMoveCommand("axis went offline before moveTo");
     }
     if (!ready_state.enabled) {
-        setLastError("axis must remain enabled before moveTo");
-        return false;
+        return rejectMoveCommand("axis must remain enabled before moveTo");
     }
 
     ProfilePositionParams params;
-    uint64_t request_id = 0;
+    uint64_t local_request_id = 0;
     {
         std::lock_guard<std::mutex> lock(*axis_command_mutexes_[axis_id]);
         std::lock_guard<std::mutex> bus_lock(master_.busMutex());
-        if (!target_axis->setProfilePositionTarget(angle_deg, velocity_deg_s, &params, &request_id)) {
-            setLastError(target_axis->lastError());
-            return false;
+        if (!target_axis->setProfilePositionTarget(angle_deg, velocity_deg_s, &params, &local_request_id)) {
+            return rejectMoveCommand(target_axis->lastError());
         }
-        if (target_axis->profileRequestId() != request_id) {
-            setLastError("moveTo was superseded before profile position parameters were applied");
-            return false;
+        if (target_axis->profileRequestId() != local_request_id) {
+            return supersedeMoveCommand("moveTo was superseded before profile position parameters were applied");
         }
         if (!applyProfilePositionParams(target_axis->slaveIndex(), params)) {
-            return false;
+            return rejectMoveCommand(lastError());
         }
-        if (target_axis->profileRequestId() != request_id) {
-            setLastError("moveTo was superseded by a newer request");
-            return false;
+        if (target_axis->profileRequestId() != local_request_id) {
+            return supersedeMoveCommand("moveTo was superseded by a newer request");
         }
     }
     {
         std::ostringstream stream;
         stream << std::fixed << std::setprecision(2)
                << "moveTo request issued"
-               << " request_id=" << request_id
+               << " request_id=" << local_request_id
                << " actual_deg=" << ready_state.actual_angle_deg
                << " target_deg=" << angle_deg
                << " velocity_deg_s=" << velocity_deg_s
@@ -839,15 +1067,71 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
     }
 
     const AxisConfig& axis_config = target_axis->config();
-    const int timeout_ms = EstimateProfilePositionTimeoutMs(
+    const int local_timeout_ms = EstimateProfilePositionTimeoutMs(
         axis_config,
         ready_state,
         angle_deg,
         velocity_deg_s);
+    if (request_id != nullptr) {
+        *request_id = local_request_id;
+    }
+    if (timeout_ms != nullptr) {
+        *timeout_ms = local_timeout_ms;
+    }
+    return MoveCommandStatus::kIssued;
+}
+
+MoveCommandStatus ErobArmController::issueProfilePositionMove(
+    int axis_id,
+    double angle_deg,
+    double velocity_deg_s,
+    bool allow_follow_transition,
+    uint64_t* request_id,
+    int* timeout_ms) {
+    bool needs_follow_stop = false;
+    if (!validateProfilePositionMove(
+            axis_id,
+            angle_deg,
+            velocity_deg_s,
+            allow_follow_transition,
+            &needs_follow_stop,
+            timeout_ms)) {
+        return MoveCommandStatus::kRejected;
+    }
+    if (needs_follow_stop) {
+        if (!stopFollowMode(axis_id)) {
+            if (lastError().empty()) {
+                setLastError("failed to stop follow mode before moveTo");
+            }
+            return MoveCommandStatus::kRejected;
+        }
+        bool follow_stop_not_needed = false;
+        if (!validateProfilePositionMove(
+                axis_id,
+                angle_deg,
+                velocity_deg_s,
+                false,
+                &follow_stop_not_needed,
+                timeout_ms)) {
+            return MoveCommandStatus::kRejected;
+        }
+    }
+    return issuePreparedProfilePositionMove(axis_id, angle_deg, velocity_deg_s, request_id, timeout_ms);
+}
+
+MoveCommandStatus ErobArmController::waitForProfilePositionMove(
+    int axis_id,
+    uint64_t request_id,
+    int timeout_ms) {
+    ErobAxis* target_axis = axis(axis_id);
+    if (target_axis == nullptr) {
+        return rejectMoveCommand("axis id out of range");
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     auto next_retrigger_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     auto next_debug_log = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    double last_progress_angle_deg = ready_state.actual_angle_deg;
+    const AxisState initial_state = target_axis->getState();
+    double last_progress_angle_deg = initial_state.actual_angle_deg;
     auto last_progress_time = std::chrono::steady_clock::now();
     int retrigger_count = 0;
     constexpr int kMaxRetriggerCount = 6;
@@ -856,24 +1140,23 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
         const AxisState current_state = target_axis->getState();
         const auto now = std::chrono::steady_clock::now();
         if (target_axis->profileRequestId() != request_id) {
-            return true;
+            std::ostringstream stream;
+            stream << "axis " << axis_id << " move request was superseded while waiting";
+            return supersedeMoveCommand(stream.str());
         }
         if (!current_state.online) {
-            setLastError("axis went offline during moveTo");
-            return false;
+            return interruptMoveCommand("axis went offline during moveTo");
         }
         if (!current_state.enabled || current_state.cia402_state == CiA402State::kQuickStopActive) {
-            setLastError("axis left operation-enabled state during moveTo");
-            return false;
+            return interruptMoveCommand("axis left operation-enabled state during moveTo");
         }
         if (current_state.fault) {
             std::ostringstream stream;
             stream << "axis fault during moveTo, error_code=0x" << std::hex << current_state.last_error_code;
-            setLastError(stream.str());
-            return false;
+            return interruptMoveCommand(stream.str());
         }
         if (current_state.target_reached) {
-            return true;
+            return MoveCommandStatus::kCompleted;
         }
         const bool has_progressed =
             std::fabs(current_state.actual_angle_deg - last_progress_angle_deg) > 0.2 ||
@@ -907,8 +1190,7 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
                 LogControllerDebug(axis_id, stream.str());
             }
             if (!target_axis->retriggerProfilePositionTarget(request_id)) {
-                setLastError("moveTo failed to retrigger profile position set-point");
-                return false;
+                return interruptMoveCommand("moveTo failed to retrigger profile position set-point");
             }
         }
         if (now >= next_debug_log) {
@@ -969,8 +1251,148 @@ bool ErobArmController::moveTo(int axis_id, double angle_deg, double velocity_de
            << " | position_state=" << PositionModeStateName(timed_out_state.position_mode_state)
            << " | target_reached=" << (timed_out_state.target_reached ? "true" : "false")
            << " | " << target_axis->profilePositionDebugString();
-    setLastError(stream.str());
-    return false;
+    return timeoutMoveCommand(stream.str());
+}
+
+MoveCommandStatus ErobArmController::waitForProfilePositionGroup(
+    const std::vector<int>& axis_ids,
+    const std::vector<uint64_t>& request_ids,
+    int timeout_ms) {
+    if (axis_ids.size() != request_ids.size()) {
+        return rejectMoveCommand("moveGroup wait vectors size mismatch");
+    }
+    if (axis_ids.empty()) {
+        return MoveCommandStatus::kCompleted;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::vector<double> last_progress_angle_deg(axis_ids.size(), 0.0);
+    std::vector<std::chrono::steady_clock::time_point> last_progress_time(
+        axis_ids.size(),
+        std::chrono::steady_clock::now());
+    std::vector<int> retrigger_count(axis_ids.size(), 0);
+    std::vector<bool> completed(axis_ids.size(), false);
+    for (std::size_t index = 0; index < axis_ids.size(); ++index) {
+        const ErobAxis* target_axis = axis(axis_ids[index]);
+        if (target_axis == nullptr) {
+            return rejectMoveCommand("moveGroup wait encountered an invalid axis");
+        }
+        last_progress_angle_deg[index] = target_axis->getState().actual_angle_deg;
+    }
+
+    auto next_retrigger_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto next_debug_log = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    constexpr int kMaxRetriggerCount = 6;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool all_completed = true;
+        const auto now = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < axis_ids.size(); ++index) {
+            if (completed[index]) {
+                continue;
+            }
+
+            ErobAxis* target_axis = axis(axis_ids[index]);
+            if (target_axis == nullptr) {
+                return rejectMoveCommand("moveGroup wait encountered an invalid axis");
+            }
+            const AxisState current_state = target_axis->getState();
+            if (target_axis->profileRequestId() != request_ids[index]) {
+                std::ostringstream stream;
+                stream << "moveGroup request on axis " << axis_ids[index] << " was superseded while waiting";
+                return supersedeMoveCommand(stream.str());
+            }
+            if (!current_state.online) {
+                std::ostringstream stream;
+                stream << "axis " << axis_ids[index] << " went offline during moveGroup";
+                return interruptMoveCommand(stream.str());
+            }
+            if (!current_state.enabled || current_state.cia402_state == CiA402State::kQuickStopActive) {
+                std::ostringstream stream;
+                stream << "axis " << axis_ids[index] << " left operation-enabled state during moveGroup";
+                return interruptMoveCommand(stream.str());
+            }
+            if (current_state.fault) {
+                std::ostringstream stream;
+                stream << "axis " << axis_ids[index] << " fault during moveGroup, error_code=0x"
+                       << std::hex << current_state.last_error_code;
+                return interruptMoveCommand(stream.str());
+            }
+            if (current_state.target_reached) {
+                completed[index] = true;
+                continue;
+            }
+
+            all_completed = false;
+            const bool has_progressed =
+                std::fabs(current_state.actual_angle_deg - last_progress_angle_deg[index]) > 0.2 ||
+                std::fabs(current_state.actual_velocity_deg_s) > 0.8;
+            if (has_progressed) {
+                last_progress_angle_deg[index] = current_state.actual_angle_deg;
+                last_progress_time[index] = now;
+            }
+
+            const bool stalled_with_error =
+                std::fabs(current_state.position_error_deg) > 0.5 &&
+                std::fabs(current_state.actual_velocity_deg_s) <= 0.5 &&
+                now >= next_retrigger_deadline &&
+                (now - last_progress_time[index]) >= std::chrono::milliseconds(180);
+            if (stalled_with_error && retrigger_count[index] < kMaxRetriggerCount) {
+                ++retrigger_count[index];
+                next_retrigger_deadline = now + std::chrono::milliseconds(250);
+                last_progress_time[index] = now;
+                last_progress_angle_deg[index] = current_state.actual_angle_deg;
+                if (!target_axis->retriggerProfilePositionTarget(request_ids[index])) {
+                    std::ostringstream stream;
+                    stream << "moveGroup failed to retrigger axis " << axis_ids[index] << " profile position set-point";
+                    return interruptMoveCommand(stream.str());
+                }
+            }
+        }
+
+        if (all_completed) {
+            return MoveCommandStatus::kCompleted;
+        }
+
+        if (now >= next_debug_log) {
+            next_debug_log = now + std::chrono::milliseconds(250);
+            std::ostringstream stream;
+            stream << "moveGroup waiting";
+            for (std::size_t index = 0; index < axis_ids.size(); ++index) {
+                const ErobAxis* target_axis = axis(axis_ids[index]);
+                if (target_axis == nullptr) {
+                    continue;
+                }
+                const AxisState current_state = target_axis->getState();
+                stream << " | axis=" << axis_ids[index]
+                       << " actual_deg=" << std::fixed << std::setprecision(2) << current_state.actual_angle_deg
+                       << " target_deg=" << current_state.target_angle_deg
+                       << " error_deg=" << current_state.position_error_deg
+                       << " velocity_deg_s=" << current_state.actual_velocity_deg_s
+                       << " target_reached=" << (current_state.target_reached ? "true" : "false");
+            }
+            LogControllerDebug(-1, stream.str());
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    std::ostringstream stream;
+    stream << "moveGroup timed out after " << timeout_ms << " ms";
+    for (std::size_t index = 0; index < axis_ids.size(); ++index) {
+        const ErobAxis* target_axis = axis(axis_ids[index]);
+        if (target_axis == nullptr) {
+            continue;
+        }
+        const AxisState state = target_axis->getState();
+        stream << " | axis=" << axis_ids[index]
+               << " actual_deg=" << std::fixed << std::setprecision(2) << state.actual_angle_deg
+               << " target_deg=" << state.target_angle_deg
+               << " error_deg=" << state.position_error_deg
+               << " velocity_deg_s=" << state.actual_velocity_deg_s
+               << " target_reached=" << (state.target_reached ? "true" : "false");
+    }
+    return timeoutMoveCommand(stream.str());
 }
 
 bool ErobArmController::startFollowMode(int axis_id) {
@@ -1610,6 +2032,26 @@ void ErobArmController::syncAxisControlRates() {
 
 std::string ErobArmController::discoveryCachePath() const {
     return "config/discovered_motors.json";
+}
+
+MoveCommandStatus ErobArmController::rejectMoveCommand(const std::string& message) {
+    setLastError(message);
+    return MoveCommandStatus::kRejected;
+}
+
+MoveCommandStatus ErobArmController::interruptMoveCommand(const std::string& message) {
+    setLastError(message);
+    return MoveCommandStatus::kInterrupted;
+}
+
+MoveCommandStatus ErobArmController::timeoutMoveCommand(const std::string& message) {
+    setLastError(message);
+    return MoveCommandStatus::kTimedOut;
+}
+
+MoveCommandStatus ErobArmController::supersedeMoveCommand(const std::string& message) {
+    setLastError(message);
+    return MoveCommandStatus::kSuperseded;
 }
 
 void ErobArmController::setLastError(const std::string& message) {

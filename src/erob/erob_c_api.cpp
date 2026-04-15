@@ -39,6 +39,42 @@ int GuardBool(ErobControllerHandle* handle, Callable&& callable) {
     }
 }
 
+ErobMoveCommandStatus ConvertMoveStatus(erob::MoveCommandStatus status) {
+    switch (status) {
+    case erob::MoveCommandStatus::kCompleted:
+        return EROB_MOVE_STATUS_COMPLETED;
+    case erob::MoveCommandStatus::kIssued:
+        return EROB_MOVE_STATUS_ISSUED;
+    case erob::MoveCommandStatus::kSuperseded:
+        return EROB_MOVE_STATUS_SUPERSEDED;
+    case erob::MoveCommandStatus::kRejected:
+        return EROB_MOVE_STATUS_REJECTED;
+    case erob::MoveCommandStatus::kTimedOut:
+        return EROB_MOVE_STATUS_TIMED_OUT;
+    case erob::MoveCommandStatus::kInterrupted:
+        return EROB_MOVE_STATUS_INTERRUPTED;
+    default:
+        return EROB_MOVE_STATUS_REJECTED;
+    }
+}
+
+template <typename Callable>
+ErobMoveCommandStatus GuardMoveStatus(ErobControllerHandle* handle, Callable&& callable) {
+    if (handle == nullptr) {
+        g_result_buffer = "invalid controller handle";
+        return EROB_MOVE_STATUS_REJECTED;
+    }
+    try {
+        return ConvertMoveStatus(callable());
+    } catch (const std::exception& error) {
+        g_result_buffer = error.what();
+        return EROB_MOVE_STATUS_REJECTED;
+    } catch (...) {
+        g_result_buffer = "unknown controller exception";
+        return EROB_MOVE_STATUS_REJECTED;
+    }
+}
+
 template <typename Callable>
 const char* GuardString(ErobControllerHandle* handle, Callable&& callable, const char* fallback = "[]") {
     if (handle == nullptr) {
@@ -210,6 +246,10 @@ int erob_controller_shutdown(ErobControllerHandle* handle) {
     return GuardBool(handle, [&]() { return handle->controller.shutdown(); });
 }
 
+int erob_controller_scan_and_initialize(ErobControllerHandle* handle) {
+    return GuardBool(handle, [&]() { return handle->controller.scanAndInitialize(); });
+}
+
 const char* erob_controller_recover_bus_and_rescan_json(ErobControllerHandle* handle) {
     return GuardString(handle, [&]() {
         if (!handle->controller.recoverBusAndRescan()) {
@@ -247,16 +287,54 @@ int erob_controller_quick_stop_all(ErobControllerHandle* handle) {
     return GuardBool(handle, [&]() { return handle->controller.quickStopAll(); });
 }
 
-int erob_controller_move_to(
+ErobMoveCommandStatus erob_controller_issue_move_to(
     ErobControllerHandle* handle,
     int axis_id,
     double angle_deg,
     double velocity_deg_s) {
-    return GuardBool(handle, [&]() { return handle->controller.moveTo(axis_id, angle_deg, velocity_deg_s); });
+    return GuardMoveStatus(handle, [&]() { return handle->controller.issueMoveTo(axis_id, angle_deg, velocity_deg_s); });
+}
+
+ErobMoveCommandStatus erob_controller_move_to(
+    ErobControllerHandle* handle,
+    int axis_id,
+    double angle_deg,
+    double velocity_deg_s) {
+    return GuardMoveStatus(handle, [&]() { return handle->controller.moveTo(axis_id, angle_deg, velocity_deg_s); });
 }
 
 int erob_controller_start_follow(ErobControllerHandle* handle, int axis_id) {
     return GuardBool(handle, [&]() { return handle->controller.startFollowMode(axis_id); });
+}
+
+int erob_controller_is_axis_busy(ErobControllerHandle* handle, int axis_id) {
+    return GuardBool(handle, [&]() { return handle->controller.isAxisBusy(axis_id); });
+}
+
+ErobMoveCommandStatus erob_controller_move_group(
+    ErobControllerHandle* handle,
+    const ErobAxisMoveRequest* requests,
+    int request_count,
+    int wait_all,
+    int strict_mode) {
+    return GuardMoveStatus(handle, [&]() {
+        if (request_count < 0) {
+            return erob::MoveCommandStatus::kRejected;
+        }
+        if (request_count > 0 && requests == nullptr) {
+            return erob::MoveCommandStatus::kRejected;
+        }
+        std::vector<erob::AxisMoveRequest> cpp_requests;
+        cpp_requests.reserve(static_cast<std::size_t>(request_count));
+        for (int index = 0; index < request_count; ++index) {
+            cpp_requests.push_back(erob::AxisMoveRequest{
+                requests[index].axis_id,
+                requests[index].angle_deg,
+                requests[index].velocity_deg_s,
+            });
+        }
+        return handle->controller.moveGroup(cpp_requests, wait_all != 0, strict_mode != 0);
+    });
 }
 
 int erob_controller_update_follow_target(ErobControllerHandle* handle, int axis_id, double angle_deg) {

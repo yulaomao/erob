@@ -74,10 +74,11 @@ else:
     _ORIENTATION_HORIZONTAL = Qt.Horizontal
     _ORIENTATION_VERTICAL = Qt.Vertical
 
-from .sdk import AxisMetadata, AxisState, ControllerError, ErobController
+from .sdk import AxisMetadata, AxisState, ControllerError, ErobController, MoveCommandStatus
 
 
 FOLLOW_ACTIVE_STATES = {"EnteringCsvMode", "Following", "Stopping"}
+MOVE_STATUS_OK = {MoveCommandStatus.COMPLETED, MoveCommandStatus.ISSUED}
 POSITION_MOVING_STATES = {"SendingSetpoint", "Moving", "Timeout"}
 
 
@@ -294,7 +295,7 @@ class MainWindow(QMainWindow):
 
         self.preferred_label = QLabel("最近扫描适配器: -")
         self.preferred_label.setObjectName("HeaderNote")
-        self.degraded_label = QLabel("总线状态: 未初始化")
+        self.degraded_label = QLabel("总线状态: 未连接")
         self.degraded_label.setObjectName("HeaderStatus")
         self.degraded_label.setWordWrap(True)
         layout.addWidget(self.preferred_label)
@@ -303,7 +304,6 @@ class MainWindow(QMainWindow):
         action_grid = QGridLayout()
         actions = [
             ("扫描设备", self.scan_devices),
-            ("初始化", self.initialize_controller),
             ("关闭", self.shutdown_controller),
             ("全使能", lambda: self.submit("enable-all", self.controller.enable_all)),
             ("全失能", lambda: self.submit("disable-all", self.controller.disable_all)),
@@ -412,24 +412,19 @@ class MainWindow(QMainWindow):
                 self._append_log(f"[{label}] 完成")
             if label == "scan-devices":
                 self.discovery_rows = list(result or [])
-                self._reload_axis_metadata()
-                self._populate_motor_table(self.discovery_rows)
-                self._refresh_binding_reports()
-                self._log_scan_snapshot()
-            elif label in {"initialize", "shutdown"}:
                 self._refresh_static_views()
-                if label == "initialize":
-                    self._log_initialize_snapshot("initialize-success")
+                self._log_scan_snapshot()
+            elif label == "shutdown":
+                self._refresh_static_views()
         else:
             self._append_log(f"[{label}] 失败: {message}")
-            if label == "initialize":
-                self._log_initialize_snapshot("initialize-failed")
+            if label == "scan-devices":
+                self._refresh_static_views()
+                if self.discovery_rows:
+                    self._log_scan_snapshot()
             if label != "follow-target-selected":
                 QMessageBox.critical(self, "控制命令失败", message)
         self.refresh_states()
-
-    def initialize_controller(self) -> None:
-        self.submit("initialize", self.controller.initialize)
 
     def shutdown_controller(self) -> None:
         self.submit("shutdown", self.controller.shutdown)
@@ -527,20 +522,6 @@ class MainWindow(QMainWindow):
         for index in range(self.target_list.count()):
             item = self.target_list.item(index)
             self._append_log(f"[scan] target item {index}: {item.text()}")
-
-    def _log_initialize_snapshot(self, prefix: str) -> None:
-        self._append_log(
-            f"[{prefix}] preferred_adapter={self.controller.try_get_preferred_adapter() or '-'} | "
-            f"discovered_motors={len(self.discovery_rows)} | axis_metadata={len(self.axis_metadata)} | "
-            f"binding_reports={len(self.binding_reports)} | target_items={self.target_list.count()}"
-        )
-        for axis_id in sorted(self.binding_reports):
-            report = self.binding_reports[axis_id]
-            self._append_log(
-                f"[{prefix}] axis={axis_id}, bound={report.get('bound', False)}, "
-                f"detail={report.get('detail', '-')}, adapter={report.get('discovered_adapter', '-')}, "
-                f"serial={report.get('discovered_serial', '-')}"
-            )
 
     def _current_axis_limits(self) -> tuple[float, float, float]:
         if not self.axis_metadata:
@@ -666,7 +647,7 @@ class MainWindow(QMainWindow):
             return axis_ids
         if not self.available_axis_ids:
             self._append_log("[selection] 当前没有扫描并绑定成功的可用轴")
-            QMessageBox.information(self, "无可用轴", "请先扫描并初始化，待轴成功绑定后才能选择控制目标。")
+            QMessageBox.information(self, "无可用轴", "请先扫描设备；系统会自动初始化，待轴成功绑定后才能选择控制目标。")
             return []
         self._append_log("[selection] 请先选择至少一个控制目标")
         QMessageBox.information(self, "未选择目标", "请先选择至少一个控制目标轴。")
@@ -716,7 +697,9 @@ class MainWindow(QMainWindow):
         errors = []
         for axis_id in axis_ids:
             try:
-                operation(axis_id)
+                result = operation(axis_id)
+                if isinstance(result, MoveCommandStatus) and result not in MOVE_STATUS_OK:
+                    errors.append(f"axis {axis_id}: {result.name.lower()}")
             except Exception as error:
                 errors.append(f"axis {axis_id}: {error}")
         if errors:
@@ -726,7 +709,9 @@ class MainWindow(QMainWindow):
     def _run_axis_batch_parallel(self, axis_ids: list[int], operation: Callable[[int], None]) -> list[int]:
         def run_single(axis_id: int) -> str | None:
             try:
-                operation(axis_id)
+                result = operation(axis_id)
+                if isinstance(result, MoveCommandStatus) and result not in MOVE_STATUS_OK:
+                    return f"axis {axis_id}: {result.name.lower()}"
                 return None
             except Exception as error:
                 return f"axis {axis_id}: {error}"

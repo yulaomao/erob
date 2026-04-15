@@ -70,16 +70,24 @@ std::string ErobAxis::lastError() const {
 bool ErobAxis::enable() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
+    const AxisState state = state_buffer_.load();
     AxisCommand command = command_buffer_.load();
     if (command.requested_mode == MotionMode::kNone) {
         command.requested_mode = MotionMode::kProfilePosition;
     }
+    command.target_angle_deg = state.actual_angle_deg;
+    command.command_updated = false;
     command.enable_requested = true;
     command.disable_requested = false;
     command.quick_stop_requested = false;
     command.reset_fault_requested = false;
     command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    profile_transition_pending_ = false;
+    pp_pulse_cycles_remaining_ = 0;
+    pending_profile_target_deg_ = state.actual_angle_deg;
+    pending_profile_velocity_deg_s_ = 0.0;
+    target_position_count_ = state.actual_position_count;
     return publishCommand(command);
 }
 
@@ -89,9 +97,11 @@ bool ErobAxis::disable() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
+    const AxisState state = state_buffer_.load();
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
+    pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
@@ -99,12 +109,17 @@ bool ErobAxis::disable() {
     interp_step_ = 0;
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kProfilePosition;
+    command.target_angle_deg = state.actual_angle_deg;
+    command.command_updated = false;
     command.disable_requested = true;
     command.enable_requested = false;
     command.quick_stop_requested = false;
     command.reset_fault_requested = false;
     command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    pending_profile_target_deg_ = state.actual_angle_deg;
+    pending_profile_velocity_deg_s_ = 0.0;
+    target_position_count_ = state.actual_position_count;
     setPositionModeState(PositionModeState::kIdle);
     setFollowModeState(FollowModeState::kIdle);
     return publishCommand(command);
@@ -114,9 +129,11 @@ bool ErobAxis::resetFault() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(false, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
+    const AxisState state = state_buffer_.load();
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
+    pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
@@ -124,12 +141,17 @@ bool ErobAxis::resetFault() {
     interp_step_ = 0;
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kProfilePosition;
+    command.target_angle_deg = state.actual_angle_deg;
+    command.command_updated = false;
     command.reset_fault_requested = true;
     command.enable_requested = false;
     command.disable_requested = true;
     command.quick_stop_requested = false;
     command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    pending_profile_target_deg_ = state.actual_angle_deg;
+    pending_profile_velocity_deg_s_ = 0.0;
+    target_position_count_ = state.actual_position_count;
     setPositionModeState(PositionModeState::kIdle);
     setFollowModeState(FollowModeState::kIdle);
     return publishCommand(command);
@@ -139,9 +161,11 @@ bool ErobAxis::quickStop() {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     quick_stop_latched_.store(true, std::memory_order_release);
     follow_active_.store(false, std::memory_order_release);
+    const AxisState state = state_buffer_.load();
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
+    pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
@@ -149,12 +173,17 @@ bool ErobAxis::quickStop() {
     interp_step_ = 0;
 
     AxisCommand command = command_buffer_.load();
+    command.target_angle_deg = state.actual_angle_deg;
+    command.command_updated = false;
     command.quick_stop_requested = true;
     command.enable_requested = true;
     command.disable_requested = false;
     command.reset_fault_requested = false;
     command.target_velocity_deg_s = 0.0;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    pending_profile_target_deg_ = state.actual_angle_deg;
+    pending_profile_velocity_deg_s_ = 0.0;
+    target_position_count_ = state.actual_position_count;
     setPositionModeState(PositionModeState::kFault);
     setFollowModeState(FollowModeState::kFault);
     return publishCommand(command);
@@ -364,6 +393,7 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
+    pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
     interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
     interp_target_velocity_deg_s_ = 0.0;
@@ -371,12 +401,16 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
 
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kCyclicSyncVelocity;
+    command.target_angle_deg = state.actual_angle_deg;
     command.target_velocity_deg_s = 0.0;
     command.command_updated = true;
     command.enable_requested = true;
     command.disable_requested = false;
     command.quick_stop_requested = false;
     command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
+    pending_profile_target_deg_ = state.actual_angle_deg;
+    pending_profile_velocity_deg_s_ = 0.0;
+    target_position_count_ = state.actual_position_count;
     setFollowModeState(FollowModeState::kStopping);
     if (request_id != nullptr) {
         *request_id = new_request_id;
@@ -630,7 +664,9 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
         !command.enable_requested;
 
     if (command.sequence != last_cycle_sequence_) {
-        if (!control_transition_requested && command.requested_mode == MotionMode::kProfilePosition) {
+        if (!control_transition_requested &&
+            command.command_updated &&
+            command.requested_mode == MotionMode::kProfilePosition) {
             target_position_count_ = angleToCount(command.target_angle_deg);
             pp_control_toggle_ ^= 0x0040U;
             pp_pulse_cycles_remaining_ = 0;
@@ -646,7 +682,9 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
                        << " toggle=0x" << std::hex << pp_control_toggle_ << std::dec;
                 LogAxisDebug(config_, stream.str());
             }
-        } else if (!control_transition_requested && command.requested_mode == MotionMode::kCyclicSyncVelocity) {
+        } else if (!control_transition_requested &&
+                   command.command_updated &&
+                   command.requested_mode == MotionMode::kCyclicSyncVelocity) {
             interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
             interp_target_velocity_deg_s_ = command.target_velocity_deg_s;
             interp_steps_ = std::max(1, cycle_hz / std::max(1, static_cast<int>(config_.follow.control_rate_hz)));
