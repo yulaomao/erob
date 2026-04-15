@@ -379,6 +379,20 @@ int EstimateGroupMoveTimeoutMs(
     return timeout_ms;
 }
 
+double ModeSwitchVelocityToleranceDegS(const erob::AxisConfig& axis_config) {
+    return std::min(0.5, axis_config.max_velocity_deg_s * 0.02);
+}
+
+std::string TimeoutErrorWithLastError(
+    const erob::ErobArmController& controller,
+    const std::string& message) {
+    const std::string last_error = controller.lastError();
+    if (last_error.empty()) {
+        return message;
+    }
+    return message + "; controller_last_error=" + last_error;
+}
+
 bool WaitForAxesProfileSettle(
     DemoContext* context,
     const std::vector<int>& axis_ids,
@@ -445,6 +459,52 @@ bool WaitForAnyAxisVelocityAbove(
     }
 
     PrintAxisStates(*context->controller, axis_ids, label + "-velocity-timeout");
+    return false;
+}
+
+bool WaitForAllAxesFollowMovingAboveSwitchThreshold(
+    DemoContext* context,
+    const std::vector<int>& axis_ids,
+    const std::string& label,
+    double margin_deg_s,
+    int timeout_ms) {
+    if (context == nullptr || context->controller == nullptr) {
+        return false;
+    }
+
+    const auto deadline = SteadyClock::now() + std::chrono::milliseconds(timeout_ms);
+    while (SteadyClock::now() < deadline) {
+        bool all_axes_moving = true;
+        for (const int axis_id : axis_ids) {
+            const erob::AxisConfig* axis_config = FindAxisConfig(*context, axis_id);
+            if (axis_config == nullptr) {
+                PrintAxisStates(*context->controller, axis_ids, label + "-missing-config");
+                return false;
+            }
+
+            const erob::AxisState state = context->controller->getAxisState(axis_id);
+            if (!state.online || state.fault) {
+                PrintAxisState(*context->controller, axis_id, label + "-fault-or-offline");
+                return false;
+            }
+
+            const double required_velocity_deg_s =
+                ModeSwitchVelocityToleranceDegS(*axis_config) + margin_deg_s;
+            const bool follow_active = state.follow_mode_state == erob::FollowModeState::kFollowing;
+            const bool moving_fast_enough = std::fabs(state.actual_velocity_deg_s) > required_velocity_deg_s;
+            if (!(follow_active && moving_fast_enough)) {
+                all_axes_moving = false;
+                break;
+            }
+        }
+
+        if (all_axes_moving) {
+            return true;
+        }
+        SleepMs(20);
+    }
+
+    PrintAxisStates(*context->controller, axis_ids, label + "-follow-moving-timeout");
     return false;
 }
 
@@ -606,10 +666,9 @@ bool RunMoveGroup(
     if (!wait_all) {
         const int timeout_ms = EstimateGroupMoveTimeoutMs(*context, requests);
         if (!WaitForAxesProfileSettle(context, RequestAxisIds(requests), label, timeout_ms)) {
-            std::string error = context->controller->lastError();
-            if (error.empty()) {
-                error = "non-blocking moveGroup did not settle within timeout";
-            }
+            const std::string error = TimeoutErrorWithLastError(
+                *context->controller,
+                "non-blocking moveGroup did not settle within timeout");
             std::cerr << '[' << label << "] moveGroup wait failed: " << error << '\n';
             RecordFailure(&context->stats, command_type, error);
             return false;
@@ -942,8 +1001,9 @@ bool RunFollowMovingRejectedMoveGroupScenario(
         }
     }
 
-    if (!WaitForAnyAxisVelocityAbove(context, context->axis_ids, label, 1.0, 1200)) {
-        const std::string error = "follow mode did not reach moving state before rejection test";
+    if (!WaitForAllAxesFollowMovingAboveSwitchThreshold(context, context->axis_ids, label, 0.5, 1500)) {
+        const std::string error =
+            "follow mode did not exceed PP switch threshold on all axes before rejection test";
         std::cerr << '[' << label << "] motion wait failed: " << error << '\n';
         RecordFailure(&context->stats, "move_group_issue_follow_moving_wait", error);
         BestEffortStopFollow(context, context->axis_ids);
@@ -1017,10 +1077,9 @@ bool RunFollowIdleIssuedMoveGroupScenario(
 
     const int timeout_ms = EstimateGroupMoveTimeoutMs(*context, requests);
     if (!WaitForAxesProfileSettle(context, RequestAxisIds(requests), label, timeout_ms)) {
-        std::string error = context->controller->lastError();
-        if (error.empty()) {
-            error = "follow-idle non-blocking moveGroup did not settle within timeout";
-        }
+        const std::string error = TimeoutErrorWithLastError(
+            *context->controller,
+            "follow-idle non-blocking moveGroup did not settle within timeout");
         std::cerr << '[' << label << "] settle wait failed: " << error << '\n';
         RecordFailure(&context->stats, "move_group_issue_follow_idle_wait", error);
         return false;

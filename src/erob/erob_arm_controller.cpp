@@ -158,7 +158,7 @@ int EstimateProfilePositionTimeoutMs(
 }
 
 double ModeSwitchVelocityToleranceDegS(const AxisConfig& axis_config) {
-    return std::max(0.5, axis_config.max_velocity_deg_s * 0.02);
+    return std::min(0.5, axis_config.max_velocity_deg_s * 0.02);
 }
 
 bool IsProfilePositionStillSettling(const AxisConfig& axis_config, const AxisState& state) {
@@ -1518,7 +1518,7 @@ bool ErobArmController::stopFollowMode(int axis_id) {
         }
 
         const bool velocity_stopped = std::fabs(current_state.actual_velocity_deg_s) <=
-            std::max(0.5, target_axis->config().max_velocity_deg_s * 0.02);
+            ModeSwitchVelocityToleranceDegS(target_axis->config());
         const bool stopping_complete =
             !target_axis->isFollowActive() &&
             current_state.follow_mode_state == FollowModeState::kIdle &&

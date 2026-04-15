@@ -29,6 +29,10 @@ void LogAxisDebug(const AxisConfig& config, const std::string& message) {
               << " | " << message << std::endl;
 }
 
+double ModeSwitchVelocityToleranceDegS(const AxisConfig& config) {
+    return std::min(0.5, config.max_velocity_deg_s * 0.02);
+}
+
 }  // namespace
 
 
@@ -579,7 +583,7 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
         const double position_tolerance_deg = abs_counts_per_degree > 1e-9
             ? std::max(0.05, 20.0 / abs_counts_per_degree)
             : 0.05;
-        const double velocity_tolerance_deg_s = std::max(0.5, config_.max_velocity_deg_s * 0.02);
+        const double velocity_tolerance_deg_s = ModeSwitchVelocityToleranceDegS(config_);
         const bool within_position_tolerance =
             std::fabs(state.position_error_deg) <= position_tolerance_deg;
         const bool within_velocity_tolerance =
@@ -616,7 +620,7 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
     }
 
     const bool follow_active = follow_active_.load(std::memory_order_acquire);
-    const double velocity_tolerance_deg_s = std::max(0.5, config_.max_velocity_deg_s * 0.02);
+    const double velocity_tolerance_deg_s = ModeSwitchVelocityToleranceDegS(config_);
     if (state.fault || state.cia402_state == CiA402State::kQuickStopActive) {
         state.follow_mode_state = FollowModeState::kFault;
     } else if (follow_active && !state.enabled) {
