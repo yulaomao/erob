@@ -17,6 +17,8 @@ except ImportError:
 
 Qt = _qt_core.Qt
 QObject = _qt_core.QObject
+QPointF = _qt_core.QPointF
+QRectF = _qt_core.QRectF
 QTimer = _qt_core.QTimer
 pyqtSignal = _qt_core.pyqtSignal
 QAbstractItemView = _qt_widgets.QAbstractItemView
@@ -44,8 +46,11 @@ QTableWidget = _qt_widgets.QTableWidget
 QTableWidgetItem = _qt_widgets.QTableWidgetItem
 QVBoxLayout = _qt_widgets.QVBoxLayout
 QWidget = _qt_widgets.QWidget
-QFont = _qt_gui.QFont
 QColor = _qt_gui.QColor
+QFont = _qt_gui.QFont
+QPainter = _qt_gui.QPainter
+QPainterPath = _qt_gui.QPainterPath
+QPen = _qt_gui.QPen
 
 if hasattr(Qt, "AlignmentFlag"):
     _ALIGN_HCENTER = Qt.AlignmentFlag.AlignHCenter
@@ -74,6 +79,7 @@ else:
     _ORIENTATION_HORIZONTAL = Qt.Horizontal
     _ORIENTATION_VERTICAL = Qt.Vertical
 
+from .follow_test import FollowTestResult, run_follow_performance_test
 from .sdk import AxisMetadata, AxisState, ControllerError, ErobController, MoveCommandStatus
 
 
@@ -97,6 +103,168 @@ class StatusChip(QLabel):
         )
 
 
+class FollowTestPlotWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._result: FollowTestResult | None = None
+        self.setMinimumHeight(380)
+
+    def clear_result(self) -> None:
+        self._result = None
+        self.update()
+
+    def set_result(self, result: FollowTestResult) -> None:
+        self._result = result
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        try:
+            if hasattr(QPainter, "RenderHint"):
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            else:
+                painter.setRenderHint(QPainter.Antialiasing)
+            painter.fillRect(self.rect(), QColor("#fffaf1"))
+
+            result = self._result
+            if result is None or not result.samples:
+                painter.setPen(QColor("#7f6d5b"))
+                alignment = Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter
+                painter.drawText(self.rect(), alignment, "运行一次随动性能测试后，这里会显示目标/实际/误差曲线")
+                return
+
+            outer = self.rect().adjusted(18, 18, -18, -18)
+            top_rect = QRectF(outer.left(), outer.top() + 26, outer.width(), outer.height() * 0.58)
+            bottom_rect = QRectF(outer.left(), top_rect.bottom() + 40, outer.width(), outer.height() * 0.26)
+
+            self._draw_panel(
+                painter,
+                top_rect,
+                "目标 / 实际角度",
+                [sample.target_angle_deg for sample in result.samples],
+                [sample.actual_angle_deg for sample in result.samples],
+                result,
+                QColor("#bc6c25"),
+                QColor("#1d3557"),
+            )
+            self._draw_panel(
+                painter,
+                bottom_rect,
+                "位置误差",
+                [sample.position_error_deg for sample in result.samples],
+                None,
+                result,
+                QColor("#c1121f"),
+                None,
+                zero_line=True,
+            )
+            self._draw_legend(painter, outer)
+        finally:
+            painter.end()
+
+    def _draw_panel(
+        self,
+        painter: QPainter,
+        rect: QRectF,
+        title: str,
+        primary_values: list[float],
+        secondary_values: list[float] | None,
+        result: FollowTestResult,
+        primary_color: QColor,
+        secondary_color: QColor | None,
+        zero_line: bool = False,
+    ) -> None:
+        painter.setPen(QPen(QColor("#d4c5ad"), 1))
+        painter.drawRoundedRect(rect, 12, 12)
+        painter.setPen(QColor("#5a4a3c"))
+        painter.drawText(QPointF(rect.left() + 12, rect.top() - 6), title)
+
+        all_values = list(primary_values)
+        if secondary_values:
+            all_values.extend(secondary_values)
+        if zero_line:
+            all_values.append(0.0)
+        min_value = min(all_values)
+        max_value = max(all_values)
+        if abs(max_value - min_value) < 1e-6:
+            max_value += 1.0
+            min_value -= 1.0
+
+        plot_rect = rect.adjusted(12, 12, -12, -12)
+        duration_s = max(result.samples[-1].elapsed_s, 1e-6)
+
+        painter.setPen(QPen(QColor("#efe3d2"), 1))
+        for fraction in (0.25, 0.5, 0.75):
+            y_pos = plot_rect.top() + plot_rect.height() * fraction
+            painter.drawLine(QPointF(plot_rect.left(), y_pos), QPointF(plot_rect.right(), y_pos))
+
+        if zero_line and min_value <= 0.0 <= max_value:
+            zero_y = self._map_value(0.0, min_value, max_value, plot_rect)
+            painter.setPen(QPen(QColor("#c9b79c"), 1))
+            painter.drawLine(QPointF(plot_rect.left(), zero_y), QPointF(plot_rect.right(), zero_y))
+
+        self._draw_series(painter, plot_rect, result, primary_values, min_value, max_value, primary_color)
+        if secondary_values and secondary_color is not None:
+            self._draw_series(painter, plot_rect, result, secondary_values, min_value, max_value, secondary_color)
+
+        painter.setPen(QColor("#7f6d5b"))
+        left_alignment = Qt.AlignmentFlag.AlignLeft if hasattr(Qt, "AlignmentFlag") else Qt.AlignLeft
+        alignment = Qt.AlignmentFlag.AlignRight if hasattr(Qt, "AlignmentFlag") else Qt.AlignRight
+        painter.drawText(QRectF(plot_rect.left(), plot_rect.bottom() + 4, 90, 18), left_alignment, "0.0 s")
+        painter.drawText(
+            QRectF(plot_rect.right() - 90, plot_rect.bottom() + 4, 90, 18),
+            alignment,
+            f"{duration_s:.1f} s",
+        )
+        painter.drawText(QPointF(plot_rect.left(), plot_rect.top() + 10), f"{max_value:.1f}°")
+        painter.drawText(QPointF(plot_rect.left(), plot_rect.bottom() - 2), f"{min_value:.1f}°")
+
+    def _draw_series(
+        self,
+        painter: QPainter,
+        plot_rect: QRectF,
+        result: FollowTestResult,
+        values: list[float],
+        min_value: float,
+        max_value: float,
+        color: QColor,
+    ) -> None:
+        if not values:
+            return
+        duration_s = max(result.samples[-1].elapsed_s, 1e-6)
+        path = QPainterPath()
+        for index, sample in enumerate(result.samples):
+            x_ratio = sample.elapsed_s / duration_s
+            x_pos = plot_rect.left() + plot_rect.width() * x_ratio
+            y_pos = self._map_value(values[index], min_value, max_value, plot_rect)
+            point = QPointF(x_pos, y_pos)
+            if index == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        painter.setPen(QPen(color, 2.0))
+        painter.drawPath(path)
+
+    def _map_value(self, value: float, min_value: float, max_value: float, plot_rect: QRectF) -> float:
+        ratio = (value - min_value) / max(max_value - min_value, 1e-6)
+        return plot_rect.bottom() - ratio * plot_rect.height()
+
+    def _draw_legend(self, painter: QPainter, rect: QRectF) -> None:
+        legend_items = [
+            (QColor("#bc6c25"), "目标角度"),
+            (QColor("#1d3557"), "实际角度"),
+            (QColor("#c1121f"), "位置误差"),
+        ]
+        x_pos = rect.left()
+        y_pos = rect.top()
+        for color, label in legend_items:
+            painter.setPen(QPen(color, 3))
+            painter.drawLine(QPointF(x_pos, y_pos), QPointF(x_pos + 18, y_pos))
+            painter.setPen(QColor("#5a4a3c"))
+            painter.drawText(QPointF(x_pos + 24, y_pos + 5), label)
+            x_pos += 112
+
+
 class MainWindow(QMainWindow):
     def __init__(self, controller: ErobController) -> None:
         super().__init__()
@@ -116,6 +284,8 @@ class MainWindow(QMainWindow):
         self.binding_reports: dict[int, dict] = {}
         self.discovery_rows: list[dict] = []
         self.adapter_rows: list[dict] = []
+        self._follow_test_running = False
+        self._follow_test_result: FollowTestResult | None = None
         self._follow_timer = QTimer(self)
         self._follow_timer.setSingleShot(True)
         self._follow_timer.setInterval(20)
@@ -159,6 +329,7 @@ class MainWindow(QMainWindow):
 
         workspace_tabs = QTabWidget()
         workspace_tabs.addTab(self._build_overview_tab(), "运行总览")
+        workspace_tabs.addTab(self._build_follow_test_tab(), "随动测试")
         workspace_tabs.addTab(self._build_discovery_tab(), "设备发现")
         workspace_tabs.addTab(self._build_log_tab(), "事件日志")
         workspace_tabs.setMinimumWidth(720)
@@ -260,6 +431,39 @@ class MainWindow(QMainWindow):
         follow_layout.addWidget(self.follow_hint_label)
         layout.addWidget(follow_box)
 
+        follow_test_box = QGroupBox("随动性能测试")
+        follow_test_layout = QVBoxLayout(follow_test_box)
+        self.follow_test_status_label = QLabel("状态: 未运行")
+        self.follow_test_status_label.setObjectName("InfoLine")
+        follow_test_layout.addWidget(self.follow_test_status_label)
+        follow_test_description = QLabel(
+            "对当前单轴执行一段 60 Hz 下发的分段余弦目标序列，包含多次跨零反向和大跨度折返；可先收小摆幅，再逐步放大挑战强度。"
+        )
+        follow_test_description.setObjectName("InfoLine")
+        follow_test_description.setWordWrap(True)
+        follow_test_layout.addWidget(follow_test_description)
+        follow_test_tuning_layout = QGridLayout()
+        follow_test_tuning_layout.addWidget(QLabel("摆幅系数"), 0, 0)
+        self.follow_test_amplitude_spin = QDoubleSpinBox()
+        self.follow_test_amplitude_spin.setRange(20.0, 100.0)
+        self.follow_test_amplitude_spin.setDecimals(0)
+        self.follow_test_amplitude_spin.setSingleStep(5.0)
+        self.follow_test_amplitude_spin.setSuffix(" %")
+        self.follow_test_amplitude_spin.setValue(60.0)
+        self.follow_test_amplitude_spin.valueChanged.connect(self._handle_follow_test_amplitude_change)
+        follow_test_tuning_layout.addWidget(self.follow_test_amplitude_spin, 0, 1)
+        follow_test_tuning_layout.addWidget(QLabel("建议先从 40% 到 60% 开始，再逐步加大。"), 1, 0, 1, 2)
+        follow_test_layout.addLayout(follow_test_tuning_layout)
+        follow_test_buttons = QHBoxLayout()
+        run_follow_test_button = QPushButton("启动随动测试")
+        run_follow_test_button.clicked.connect(self._start_follow_performance_test)
+        clear_follow_test_button = QPushButton("清空结果")
+        clear_follow_test_button.clicked.connect(self._clear_follow_test_result)
+        follow_test_buttons.addWidget(run_follow_test_button)
+        follow_test_buttons.addWidget(clear_follow_test_button)
+        follow_test_layout.addLayout(follow_test_buttons)
+        layout.addWidget(follow_test_box)
+
         action_box = QGroupBox("基础动作")
         action_layout = QGridLayout(action_box)
         enable_button = QPushButton("使能已选轴")
@@ -355,7 +559,19 @@ class MainWindow(QMainWindow):
         panel_layout = panel.layout()
         self.axis_table = QTableWidget(len(self.axis_metadata), 11)
         self.axis_table.setHorizontalHeaderLabels(
-            ["选中", "轴", "关节", "在线", "使能", "故障", "当前角度", "目标角度", "速度", "模式", "绑定"]
+            [
+                "选中",
+                "轴",
+                "关节",
+                "在线",
+                "使能",
+                "故障",
+                "当前角度",
+                "目标角度",
+                "速度",
+                "模式",
+                "绑定",
+            ]
         )
         self.axis_table.horizontalHeader().setStretchLastSection(True)
         self.axis_table.verticalHeader().setVisible(False)
@@ -374,6 +590,43 @@ class MainWindow(QMainWindow):
         self.motor_table.setHorizontalHeaderLabels(["适配器", "从站", "名称", "序列号", "eRob"])
         self.motor_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._wrap_panel("扫描到的设备", self.motor_table), 1)
+        return page
+
+    def _build_follow_test_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        summary = QFrame()
+        summary.setObjectName("OverviewPanel")
+        summary_layout = QGridLayout(summary)
+        summary_layout.setHorizontalSpacing(16)
+        summary_layout.setVerticalSpacing(10)
+
+        self.follow_test_axis_label = QLabel("测试轴: -")
+        self.follow_test_axis_label.setObjectName("InfoLine")
+        self.follow_test_profile_label = QLabel("序列特征: 60 Hz 分段余弦、多次反向、大跨度折返 | 摆幅 60%")
+        self.follow_test_profile_label.setObjectName("InfoLine")
+        self.follow_test_metrics_label = QLabel("误差指标: -")
+        self.follow_test_metrics_label.setObjectName("InfoLine")
+        self.follow_test_metrics_label.setWordWrap(True)
+        self.follow_test_dynamic_label = QLabel("动态指标: -")
+        self.follow_test_dynamic_label.setObjectName("InfoLine")
+        self.follow_test_dynamic_label.setWordWrap(True)
+
+        summary_layout.addWidget(QLabel("测试对象"), 0, 0)
+        summary_layout.addWidget(self.follow_test_axis_label, 0, 1)
+        summary_layout.addWidget(QLabel("目标序列"), 1, 0)
+        summary_layout.addWidget(self.follow_test_profile_label, 1, 1)
+        summary_layout.addWidget(QLabel("误差表现"), 2, 0)
+        summary_layout.addWidget(self.follow_test_metrics_label, 2, 1)
+        summary_layout.addWidget(QLabel("动态表现"), 3, 0)
+        summary_layout.addWidget(self.follow_test_dynamic_label, 3, 1)
+        layout.addWidget(summary)
+
+        self.follow_test_plot = FollowTestPlotWidget()
+        layout.addWidget(self._wrap_panel("曲线结果", self.follow_test_plot), 1)
         return page
 
     def _build_log_tab(self) -> QWidget:
@@ -416,7 +669,13 @@ class MainWindow(QMainWindow):
                 self._log_scan_snapshot()
             elif label == "shutdown":
                 self._refresh_static_views()
+            elif label == "follow-performance-test":
+                self._follow_test_running = False
+                self._apply_follow_test_result(result)
         else:
+            if label == "follow-performance-test":
+                self._follow_test_running = False
+                self.follow_test_status_label.setText(f"状态: 失败 | {message}")
             self._append_log(f"[{label}] 失败: {message}")
             if label == "scan-devices":
                 self._refresh_static_views()
@@ -802,6 +1061,102 @@ class MainWindow(QMainWindow):
         self.follow_target_label.setText(f"目标: {self._pending_follow_target:.1f}°")
         if self._selected_follow_axes():
             self._follow_timer.start()
+
+    def _handle_follow_test_amplitude_change(self, value: float) -> None:
+        if self._follow_test_running:
+            return
+        self.follow_test_profile_label.setText(
+            f"序列特征: 60 Hz 分段余弦、多次反向、大跨度折返 | 摆幅 {value:.0f}%"
+        )
+
+    def _start_follow_performance_test(self) -> None:
+        if self._follow_test_running:
+            QMessageBox.information(self, "测试进行中", "当前已有一项随动性能测试正在运行。")
+            return
+        axis_ids = self.selected_axis_ids()
+        if not axis_ids:
+            return
+        if len(axis_ids) != 1:
+            QMessageBox.information(self, "请选择单轴", "随动性能测试一次只支持一根轴，请先只选择一个控制目标。")
+            return
+
+        axis_id = axis_ids[0]
+        if axis_id >= len(self.axis_states):
+            QMessageBox.information(self, "状态未就绪", "当前轴状态尚未刷新完成，请稍后再试。")
+            return
+        state = self.axis_states[axis_id]
+        if not state.online or not state.enabled or state.fault:
+            QMessageBox.information(self, "轴状态不满足", "测试前需要轴在线、已使能且无故障。")
+            return
+        if state.follow_mode_name in FOLLOW_ACTIVE_STATES:
+            QMessageBox.information(self, "随动仍在运行", "请先停止当前随动，再启动性能测试。")
+            return
+
+        metadata = self.axis_metadata_by_id.get(axis_id)
+        if metadata is None:
+            QMessageBox.information(self, "缺少轴配置", f"未找到 axis {axis_id} 的配置元数据。")
+            return
+
+        amplitude_scale = self.follow_test_amplitude_spin.value() / 100.0
+        self._follow_test_running = True
+        self.follow_test_status_label.setText(
+            f"状态: 正在测试 Axis {axis_id} | 60 Hz 分段余弦目标序列 | 摆幅 {amplitude_scale * 100:.0f}%"
+        )
+        self.submit(
+            "follow-performance-test",
+            lambda target_axis_id=axis_id, target_metadata=metadata, target_amplitude=amplitude_scale: run_follow_performance_test(
+                self.controller,
+                target_axis_id,
+                target_metadata,
+                amplitude_scale=target_amplitude,
+            ),
+        )
+
+    def _apply_follow_test_result(self, result: object) -> None:
+        if not isinstance(result, FollowTestResult):
+            return
+        self._follow_test_result = result
+        self.follow_test_plot.set_result(result)
+        self.follow_test_status_label.setText(
+            f"状态: 完成 | Axis {result.axis_id} {result.axis_name} | 样本 {len(result.samples)}"
+        )
+        self.follow_test_axis_label.setText(
+            f"测试轴: Axis {result.axis_id} | {result.axis_name} | 用时 {result.duration_s:.2f} s"
+        )
+        self.follow_test_profile_label.setText(
+            "序列特征: "
+            f"60 Hz 分段余弦、多次反向、大跨度折返 | 摆幅 {result.amplitude_scale * 100:.0f}%"
+        )
+        self.follow_test_metrics_label.setText(
+            "误差指标: "
+            f"max {result.max_abs_error_deg:.2f}° | mean {result.mean_abs_error_deg:.2f}° | "
+            f"RMS {result.rms_error_deg:.2f}° | P95 {result.p95_abs_error_deg:.2f}°"
+        )
+        self.follow_test_dynamic_label.setText(
+            "动态指标: "
+            f"目标跨度 {result.target_span_deg:.1f}° | 反向次数 {result.reversal_count} | "
+            f"峰值速度 {result.peak_velocity_deg_s:.1f}°/s"
+        )
+        self._append_log(
+            "[follow-performance-test] "
+            f"axis={result.axis_id}, samples={len(result.samples)}, max_err={result.max_abs_error_deg:.2f}deg, "
+            f"rms_err={result.rms_error_deg:.2f}deg, reversals={result.reversal_count}, "
+            f"peak_vel={result.peak_velocity_deg_s:.1f}deg/s, amplitude={result.amplitude_scale * 100:.0f}%"
+        )
+
+    def _clear_follow_test_result(self) -> None:
+        if self._follow_test_running:
+            QMessageBox.information(self, "测试进行中", "当前测试尚未结束，暂不能清空结果。")
+            return
+        self._follow_test_result = None
+        self.follow_test_plot.clear_result()
+        self.follow_test_status_label.setText("状态: 未运行")
+        self.follow_test_axis_label.setText("测试轴: -")
+        self.follow_test_profile_label.setText(
+            f"序列特征: 60 Hz 分段余弦、多次反向、大跨度折返 | 摆幅 {self.follow_test_amplitude_spin.value():.0f}%"
+        )
+        self.follow_test_metrics_label.setText("误差指标: -")
+        self.follow_test_dynamic_label.setText("动态指标: -")
 
     def _emit_follow_target(self) -> None:
         axis_ids = self._selected_follow_axes()
