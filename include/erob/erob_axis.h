@@ -33,7 +33,6 @@ public:
     bool enterFollowMode(uint64_t* request_id = nullptr);
     bool updateFollowTarget(double angle_deg);
     bool stopFollowMode(uint64_t* request_id = nullptr);
-    void planFollowStep();
 
     void updateFeedback(const TxPdoCommon& txpdo, int al_status_code);
     void updateLastErrorCode(int error_code);
@@ -58,6 +57,15 @@ private:
     int32_t velocityToCount(double velocity_deg_s) const;
     double countToVelocity(int32_t count_per_second) const;
     uint16_t computeControlword(const AxisState& state, const AxisCommand& command) const;
+    void resetFollowPlannerState(const AxisState& state);
+    void updateTargetTrajectory(double angle_deg, int64_t now_ns);
+    void updateMeasuredMotion(AxisState* state);
+    double planFollowVelocityForCycle(const AxisState& state, double dt, int64_t now_ns);
+    double advanceVelocityPlanner(
+        const AxisState& state,
+        double desired_velocity_deg_s,
+        double desired_accel_deg_s2,
+        double dt);
     double applyVelocityLimiter(const AxisState& state, double velocity_deg_s) const;
     void setPositionModeState(PositionModeState state);
     void setFollowModeState(FollowModeState state);
@@ -83,6 +91,14 @@ private:
 
     double planner_filtered_target_deg_ = 0.0;
     double planner_velocity_deg_s_ = 0.0;
+    double planner_accel_deg_s2_ = 0.0;
+    double target_track_velocity_deg_s_ = 0.0;
+    double target_track_accel_deg_s2_ = 0.0;
+    double last_follow_target_sample_deg_ = 0.0;
+    double measured_accel_deg_s2_ = 0.0;
+    double measured_jerk_deg_s3_ = 0.0;
+    double last_feedback_velocity_deg_s_ = 0.0;
+    int64_t last_feedback_ns_ = 0;
     bool follow_positive_limit_hold_ = false;
     bool follow_negative_limit_hold_ = false;
     bool profile_transition_pending_ = false;

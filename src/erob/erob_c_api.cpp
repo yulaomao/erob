@@ -219,6 +219,13 @@ void FillAxisStateValue(const erob::AxisState& state, ErobAxisStateValue* out_st
     CopyString(out_state->cia402_state_name, sizeof(out_state->cia402_state_name), erob::CiA402StateName(state.cia402_state));
     CopyString(out_state->position_mode_name, sizeof(out_state->position_mode_name), erob::PositionModeStateName(state.position_mode_state));
     CopyString(out_state->follow_mode_name, sizeof(out_state->follow_mode_name), erob::FollowModeStateName(state.follow_mode_state));
+    out_state->actual_accel_deg_s2 = state.actual_accel_deg_s2;
+    out_state->actual_jerk_deg_s3 = state.actual_jerk_deg_s3;
+    out_state->follow_reference_angle_deg = state.follow_reference_angle_deg;
+    out_state->follow_reference_velocity_deg_s = state.follow_reference_velocity_deg_s;
+    out_state->follow_reference_accel_deg_s2 = state.follow_reference_accel_deg_s2;
+    out_state->follow_output_velocity_deg_s = state.follow_output_velocity_deg_s;
+    out_state->follow_output_accel_deg_s2 = state.follow_output_accel_deg_s2;
 }
 
 }  // namespace

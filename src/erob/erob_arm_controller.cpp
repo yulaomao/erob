@@ -1614,7 +1614,6 @@ bool ErobArmController::startThreads() {
     }
 
     cycle_thread_ = std::thread(&ErobArmController::cycleLoop, this);
-    follow_thread_ = std::thread(&ErobArmController::followLoop, this);
     monitor_thread_ = std::thread(&ErobArmController::monitorLoop, this);
     return true;
 }
@@ -1625,9 +1624,6 @@ void ErobArmController::stopThreads() {
     }
     if (cycle_thread_.joinable()) {
         cycle_thread_.join();
-    }
-    if (follow_thread_.joinable()) {
-        follow_thread_.join();
     }
     if (monitor_thread_.joinable()) {
         monitor_thread_.join();
@@ -1676,23 +1672,6 @@ void ErobArmController::cycleLoop() {
             master_.sendProcessDataNoLock();
         }
 
-        std::this_thread::sleep_until(next_tick);
-    }
-}
-
-void ErobArmController::followLoop() {
-    SetCurrentThreadRealtime(20);
-    SetCurrentThreadAffinity(1);
-    const auto follow_time = std::chrono::microseconds(1000000 / std::max(1, config_.follow_control_hz));
-    auto next_tick = std::chrono::steady_clock::now();
-
-    while (running_.load(std::memory_order_acquire)) {
-        next_tick += follow_time;
-        for (const std::unique_ptr<ErobAxis>& axis_ptr : axes_) {
-            if (axis_ptr != nullptr) {
-                axis_ptr->planFollowStep();
-            }
-        }
         std::this_thread::sleep_until(next_tick);
     }
 }

@@ -65,6 +65,13 @@ typedef struct ErobAxisStateValue {
     char cia402_state_name[EROB_TEXT_MEDIUM];
     char position_mode_name[EROB_TEXT_MEDIUM];
     char follow_mode_name[EROB_TEXT_MEDIUM];
+    double actual_accel_deg_s2;
+    double actual_jerk_deg_s3;
+    double follow_reference_angle_deg;
+    double follow_reference_velocity_deg_s;
+    double follow_reference_accel_deg_s2;
+    double follow_output_velocity_deg_s;
+    double follow_output_accel_deg_s2;
 } ErobAxisStateValue;
 
 typedef struct ErobAxisMoveRequest {

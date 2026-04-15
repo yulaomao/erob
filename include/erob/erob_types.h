@@ -190,7 +190,14 @@ struct AxisState {
     int16_t actual_torque = 0;
     double actual_angle_deg = 0.0;
     double actual_velocity_deg_s = 0.0;
+    double actual_accel_deg_s2 = 0.0;
+    double actual_jerk_deg_s3 = 0.0;
     double target_angle_deg = 0.0;
+    double follow_reference_angle_deg = 0.0;
+    double follow_reference_velocity_deg_s = 0.0;
+    double follow_reference_accel_deg_s2 = 0.0;
+    double follow_output_velocity_deg_s = 0.0;
+    double follow_output_accel_deg_s2 = 0.0;
     double position_error_deg = 0.0;
     bool target_reached = false;
     bool near_positive_limit = false;

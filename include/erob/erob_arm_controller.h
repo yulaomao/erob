@@ -76,7 +76,6 @@ private:
     void stopThreads();
     bool initializeNoRecovery();
     void cycleLoop();
-    void followLoop();
     void monitorLoop();
     bool loadDiscoveryCache();
     bool canRescan() const;
@@ -137,7 +136,6 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> initialized_{false};
     std::thread cycle_thread_;
-    std::thread follow_thread_;
     std::thread monitor_thread_;
     std::atomic<int> wkc_miss_count_{0};
     std::atomic<int> recovery_fail_count_{0};

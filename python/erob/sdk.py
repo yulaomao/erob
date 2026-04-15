@@ -57,6 +57,13 @@ class _AxisStateStruct(ctypes.Structure):
         ("cia402_state_name", ctypes.c_char * 64),
         ("position_mode_name", ctypes.c_char * 64),
         ("follow_mode_name", ctypes.c_char * 64),
+        ("actual_accel_deg_s2", ctypes.c_double),
+        ("actual_jerk_deg_s3", ctypes.c_double),
+        ("follow_reference_angle_deg", ctypes.c_double),
+        ("follow_reference_velocity_deg_s", ctypes.c_double),
+        ("follow_reference_accel_deg_s2", ctypes.c_double),
+        ("follow_output_velocity_deg_s", ctypes.c_double),
+        ("follow_output_accel_deg_s2", ctypes.c_double),
     ]
 
 
@@ -91,7 +98,14 @@ class AxisState:
     actual_torque: int
     actual_angle_deg: float
     actual_velocity_deg_s: float
+    actual_accel_deg_s2: float
+    actual_jerk_deg_s3: float
     target_angle_deg: float
+    follow_reference_angle_deg: float
+    follow_reference_velocity_deg_s: float
+    follow_reference_accel_deg_s2: float
+    follow_output_velocity_deg_s: float
+    follow_output_accel_deg_s2: float
     position_error_deg: float
     target_reached: bool
     near_positive_limit: bool
@@ -569,7 +583,14 @@ class ErobController:
             actual_torque=int(raw.actual_torque),
             actual_angle_deg=float(raw.actual_angle_deg),
             actual_velocity_deg_s=float(raw.actual_velocity_deg_s),
+            actual_accel_deg_s2=float(raw.actual_accel_deg_s2),
+            actual_jerk_deg_s3=float(raw.actual_jerk_deg_s3),
             target_angle_deg=float(raw.target_angle_deg),
+            follow_reference_angle_deg=float(raw.follow_reference_angle_deg),
+            follow_reference_velocity_deg_s=float(raw.follow_reference_velocity_deg_s),
+            follow_reference_accel_deg_s2=float(raw.follow_reference_accel_deg_s2),
+            follow_output_velocity_deg_s=float(raw.follow_output_velocity_deg_s),
+            follow_output_accel_deg_s2=float(raw.follow_output_accel_deg_s2),
             position_error_deg=float(raw.position_error_deg),
             target_reached=bool(raw.target_reached),
             near_positive_limit=bool(raw.near_positive_limit),

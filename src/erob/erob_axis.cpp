@@ -18,6 +18,7 @@ constexpr double kFollowInputMaxAngleDeg = 130.0;
 constexpr double kFollowFirstJumpLimitDeg = 40.0;
 // 跟随模式后续目标跳变允许的最大角度
 constexpr double kFollowJumpLimitDeg = 20.0;
+constexpr double kNsToSeconds = 1e-9;
 
 // 线程安全的调试日志输出，便于定位轴的状态变化
 void LogAxisDebug(const AxisConfig& config, const std::string& message) {
@@ -106,11 +107,7 @@ bool ErobAxis::disable() {
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
-    planner_velocity_deg_s_ = 0.0;
-    interp_start_velocity_deg_s_ = 0.0;
-    interp_target_velocity_deg_s_ = 0.0;
-    interpolated_velocity_deg_s_ = 0.0;
-    interp_step_ = 0;
+    resetFollowPlannerState(state);
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kProfilePosition;
     command.target_angle_deg = state.actual_angle_deg;
@@ -138,11 +135,7 @@ bool ErobAxis::resetFault() {
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
-    planner_velocity_deg_s_ = 0.0;
-    interp_start_velocity_deg_s_ = 0.0;
-    interp_target_velocity_deg_s_ = 0.0;
-    interpolated_velocity_deg_s_ = 0.0;
-    interp_step_ = 0;
+    resetFollowPlannerState(state);
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kProfilePosition;
     command.target_angle_deg = state.actual_angle_deg;
@@ -170,11 +163,7 @@ bool ErobAxis::quickStop() {
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
-    planner_velocity_deg_s_ = 0.0;
-    interp_start_velocity_deg_s_ = 0.0;
-    interp_target_velocity_deg_s_ = 0.0;
-    interpolated_velocity_deg_s_ = 0.0;
-    interp_step_ = 0;
+    resetFollowPlannerState(state);
 
     AxisCommand command = command_buffer_.load();
     command.target_angle_deg = state.actual_angle_deg;
@@ -229,11 +218,7 @@ bool ErobAxis::setProfilePositionTarget(
     follow_active_.store(false, std::memory_order_release);
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
-    planner_velocity_deg_s_ = 0.0;
-    interp_start_velocity_deg_s_ = 0.0;
-    interp_target_velocity_deg_s_ = 0.0;
-    interpolated_velocity_deg_s_ = 0.0;
-    interp_step_ = 0;
+    resetFollowPlannerState(state);
 
     command.requested_mode = MotionMode::kProfilePosition;
     command.target_angle_deg = clamped_angle;
@@ -303,8 +288,7 @@ bool ErobAxis::enterFollowMode(uint64_t* request_id) {
     follow_negative_limit_hold_ = false;
     last_follow_target_ns_.store(SteadyClockNowNs(), std::memory_order_release);
     follow_target_deg_.store(state.actual_angle_deg, std::memory_order_release);
-    planner_filtered_target_deg_ = state.actual_angle_deg;
-    planner_velocity_deg_s_ = 0.0;
+    resetFollowPlannerState(state);
 
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kCyclicSyncVelocity;
@@ -367,8 +351,7 @@ bool ErobAxis::updateFollowTarget(double angle_deg) {
     if (shouldRejectFollowTarget(angle_deg, state)) {
         return true;
     }
-    follow_target_deg_.store(clampAngle(angle_deg), std::memory_order_release);
-    last_follow_target_ns_.store(SteadyClockNowNs(), std::memory_order_release);
+    updateTargetTrajectory(clampAngle(angle_deg), SteadyClockNowNs());
     follow_first_update_pending_.store(false, std::memory_order_release);
     return true;
 }
@@ -398,10 +381,7 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
     follow_negative_limit_hold_ = false;
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
-    planner_velocity_deg_s_ = 0.0;
-    interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
-    interp_target_velocity_deg_s_ = 0.0;
-    interp_step_ = 0;
+    planner_accel_deg_s2_ = 0.0;
 
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kCyclicSyncVelocity;
@@ -422,138 +402,6 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
     return publishCommand(command);
 }
 
-void ErobAxis::planFollowStep() {
-    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
-    const bool follow_active = follow_active_.load(std::memory_order_acquire);
-    if (!follow_active) {
-        return;
-    }
-
-    const AxisState state = state_buffer_.load();
-    if (state.fault || state.cia402_state == CiA402State::kQuickStopActive) {
-        setFollowModeState(FollowModeState::kFault);
-        planner_velocity_deg_s_ = 0.0;
-        return;
-    }
-    if (!state.online || !state.enabled) {
-        planner_velocity_deg_s_ = 0.0;
-
-        AxisCommand command = command_buffer_.load();
-        command.requested_mode = MotionMode::kCyclicSyncVelocity;
-        command.target_velocity_deg_s = 0.0;
-        command.command_updated = true;
-        command.enable_requested = true;
-        command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
-        setFollowModeState(FollowModeState::kWaitingEnable);
-        publishCommand(command);
-        return;
-    }
-
-    const double dt = 1.0 / std::max(1.0, config_.follow.control_rate_hz);
-
-    double desired_velocity = 0.0;
-    const double raw_target = follow_target_deg_.load(std::memory_order_acquire);
-    const double clamped_target = clampAngle(raw_target);
-    const double limit_hold_band_deg = std::max(2.0, config_.follow.position_limit_margin_deg * 0.4);
-    const double limit_settle_deg = 1.0;
-    const double limit_capture_velocity_deg_s =
-        std::max(2.0, config_.follow.max_velocity_deg_s * 0.03);
-    const double limit_soft_target_offset_deg = limit_hold_band_deg;
-    const double limit_release_band_deg = limit_hold_band_deg + 1.0;
-    const bool target_at_positive_limit = clamped_target >= (config_.max_angle_deg - 1e-6);
-    const bool target_at_negative_limit = clamped_target <= (config_.min_angle_deg + 1e-6);
-    const bool target_near_positive_limit = clamped_target >= (config_.max_angle_deg - limit_hold_band_deg);
-    const bool target_near_negative_limit = clamped_target <= (config_.min_angle_deg + limit_hold_band_deg);
-    double effective_target_deg = clamped_target;
-    if (target_at_positive_limit) {
-        effective_target_deg = config_.max_angle_deg - limit_soft_target_offset_deg;
-    } else if (target_at_negative_limit) {
-        effective_target_deg = config_.min_angle_deg + limit_soft_target_offset_deg;
-    }
-    planner_filtered_target_deg_ =
-        config_.follow.target_filter_alpha * effective_target_deg +
-        (1.0 - config_.follow.target_filter_alpha) * planner_filtered_target_deg_;
-
-
-    if (follow_positive_limit_hold_ && clamped_target < (config_.max_angle_deg - limit_release_band_deg)) {
-        follow_positive_limit_hold_ = false;
-    }
-    if (follow_negative_limit_hold_ && clamped_target > (config_.min_angle_deg + limit_release_band_deg)) {
-        follow_negative_limit_hold_ = false;
-    }
-
-    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
-        const double error = planner_filtered_target_deg_ - state.actual_angle_deg;
-        if (std::fabs(error) > config_.follow.deadband_deg) {
-            desired_velocity = config_.follow.kp * error - config_.follow.kd * state.actual_velocity_deg_s;
-        }
-    }
-
-    desired_velocity = Clamp(
-        desired_velocity,
-        -config_.follow.max_velocity_deg_s,
-        config_.follow.max_velocity_deg_s);
-
-    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
-        const double max_accel = desired_velocity >= planner_velocity_deg_s_
-            ? config_.follow.max_accel_deg_s2
-            : config_.follow.max_decel_deg_s2;
-        const double accel_step = max_accel * dt;
-        if (desired_velocity > planner_velocity_deg_s_) {
-            desired_velocity = std::min(desired_velocity, planner_velocity_deg_s_ + accel_step);
-        } else {
-            desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
-        }
-    }
-
-    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
-        const double pos_error = std::fabs(effective_target_deg - state.actual_angle_deg);
-        const double limited_velocity_for_hold = applyVelocityLimiter(state, desired_velocity);
-        const bool can_capture_positive_limit =
-            target_near_positive_limit &&
-            state.actual_angle_deg >= (config_.max_angle_deg - limit_hold_band_deg) &&
-            (pos_error < limit_settle_deg ||
-             std::fabs(limited_velocity_for_hold) <= limit_capture_velocity_deg_s);
-        const bool can_capture_negative_limit =
-            target_near_negative_limit &&
-            state.actual_angle_deg <= (config_.min_angle_deg + limit_hold_band_deg) &&
-            (pos_error < limit_settle_deg ||
-             std::fabs(limited_velocity_for_hold) <= limit_capture_velocity_deg_s);
-
-        if (can_capture_positive_limit) {
-            follow_positive_limit_hold_ = true;
-        } else if (can_capture_negative_limit) {
-            follow_negative_limit_hold_ = true;
-        }
-    }
-
-    const bool holding_limit = follow_positive_limit_hold_ || follow_negative_limit_hold_;
-    if (holding_limit) {
-        planner_filtered_target_deg_ = Clamp(
-            state.actual_angle_deg,
-            config_.min_angle_deg,
-            config_.max_angle_deg);
-        desired_velocity = 0.0;
-    }
-
-    planner_velocity_deg_s_ = desired_velocity;
-
-    AxisCommand command = command_buffer_.load();
-    command.requested_mode = MotionMode::kCyclicSyncVelocity;
-    command.target_velocity_deg_s = desired_velocity;
-    command.command_updated = true;
-    command.enable_requested = true;
-    command.disable_requested = false;
-    command.quick_stop_requested = false;
-    command.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
-    if (state.motion_mode != MotionMode::kCyclicSyncVelocity) {
-        setFollowModeState(FollowModeState::kEnteringCsvMode);
-    } else {
-        setFollowModeState(FollowModeState::kFollowing);
-    }
-    publishCommand(command);
-}
-
 void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     AxisState state = state_buffer_.load();
@@ -569,6 +417,7 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
         state.cia402_state == CiA402State::kFaultReactionActive;
     state.actual_angle_deg = countToAngle(txpdo.actual_position);
     state.actual_velocity_deg_s = countToVelocity(txpdo.actual_velocity);
+    updateMeasuredMotion(&state);
     state.target_angle_deg = follow_active_.load(std::memory_order_acquire)
         ? follow_target_deg_.load(std::memory_order_acquire)
         : command.target_angle_deg;
@@ -597,6 +446,11 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
         state.position_error_deg = state.target_angle_deg - state.actual_angle_deg;
         state.target_reached = false;
     }
+    state.follow_reference_angle_deg = planner_filtered_target_deg_;
+    state.follow_reference_velocity_deg_s = target_track_velocity_deg_s_;
+    state.follow_reference_accel_deg_s2 = target_track_accel_deg_s2_;
+    state.follow_output_velocity_deg_s = planner_velocity_deg_s_;
+    state.follow_output_accel_deg_s2 = planner_accel_deg_s2_;
     state.near_positive_limit = state.actual_angle_deg >=
         (config_.max_angle_deg - config_.follow.position_limit_margin_deg);
     state.near_negative_limit = state.actual_angle_deg <=
@@ -658,6 +512,7 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     const AxisState state = state_buffer_.load();
     const AxisCommand command = command_buffer_.load();
+    const double dt = 1.0 / std::max(1.0, static_cast<double>(cycle_hz));
     constexpr uint16_t kPpControlwordBase = 0x000FU;
     constexpr uint16_t kPpControlwordNewSetpoint = 0x001FU;
     constexpr int kPpPulseCycles = 3;
@@ -689,9 +544,11 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
         } else if (!control_transition_requested &&
                    command.command_updated &&
                    command.requested_mode == MotionMode::kCyclicSyncVelocity) {
-            interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
+            planner_velocity_deg_s_ = state.actual_velocity_deg_s;
+            planner_accel_deg_s2_ = state.actual_accel_deg_s2;
+            interpolated_velocity_deg_s_ = state.actual_velocity_deg_s;
+            interp_start_velocity_deg_s_ = state.actual_velocity_deg_s;
             interp_target_velocity_deg_s_ = command.target_velocity_deg_s;
-            interp_steps_ = std::max(1, cycle_hz / std::max(1, static_cast<int>(config_.follow.control_rate_hz)));
             interp_step_ = 0;
             if (follow_active_.load(std::memory_order_acquire)) {
                 setFollowModeState(FollowModeState::kEnteringCsvMode);
@@ -699,6 +556,7 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
         } else if (control_transition_requested) {
             pp_pulse_cycles_remaining_ = 0;
             profile_transition_pending_ = false;
+            planner_accel_deg_s2_ = 0.0;
         }
         last_cycle_sequence_ = command.sequence;
     }
@@ -717,17 +575,22 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
     }
 
     if (command.requested_mode == MotionMode::kCyclicSyncVelocity) {
-        if (interp_step_ < interp_steps_) {
-            const double ratio = static_cast<double>(interp_step_) / static_cast<double>(interp_steps_);
-            interpolated_velocity_deg_s_ =
-                interp_start_velocity_deg_s_ +
-                ratio * (interp_target_velocity_deg_s_ - interp_start_velocity_deg_s_);
-            ++interp_step_;
+        double csv_velocity_deg_s = 0.0;
+        if (!control_transition_requested) {
+            if (follow_active_.load(std::memory_order_acquire)) {
+                csv_velocity_deg_s = planFollowVelocityForCycle(state, dt, SteadyClockNowNs());
+            } else {
+                const double desired_velocity = applyVelocityLimiter(state, command.target_velocity_deg_s);
+                const double desired_accel =
+                    (desired_velocity - planner_velocity_deg_s_) / std::max(dt, 1e-6);
+                csv_velocity_deg_s = advanceVelocityPlanner(state, desired_velocity, desired_accel, dt);
+            }
         } else {
-            interpolated_velocity_deg_s_ = interp_target_velocity_deg_s_;
+            planner_accel_deg_s2_ = 0.0;
+            planner_velocity_deg_s_ = 0.0;
         }
-        interpolated_velocity_deg_s_ = applyVelocityLimiter(state, interpolated_velocity_deg_s_);
-        pdo.target_velocity = velocityToCount(interpolated_velocity_deg_s_);
+        interpolated_velocity_deg_s_ = csv_velocity_deg_s;
+        pdo.target_velocity = velocityToCount(csv_velocity_deg_s);
         pdo.target_position = state.actual_position_count;
     }
 
@@ -758,6 +621,11 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
 
     AxisState next_state = state;
     next_state.controlword = pdo.controlword;
+    next_state.follow_reference_angle_deg = planner_filtered_target_deg_;
+    next_state.follow_reference_velocity_deg_s = target_track_velocity_deg_s_;
+    next_state.follow_reference_accel_deg_s2 = target_track_accel_deg_s2_;
+    next_state.follow_output_velocity_deg_s = planner_velocity_deg_s_;
+    next_state.follow_output_accel_deg_s2 = planner_accel_deg_s2_;
     state_buffer_.publish(next_state);
 
     return pdo;
@@ -865,6 +733,301 @@ double ErobAxis::countToVelocity(int32_t count_per_second) const {
         return 0.0;
     }
     return static_cast<double>(count_per_second) / config_.counts_per_degree;
+}
+
+void ErobAxis::resetFollowPlannerState(const AxisState& state) {
+    planner_filtered_target_deg_ = state.actual_angle_deg;
+    planner_velocity_deg_s_ = state.actual_velocity_deg_s;
+    planner_accel_deg_s2_ = state.actual_accel_deg_s2;
+    target_track_velocity_deg_s_ = 0.0;
+    target_track_accel_deg_s2_ = 0.0;
+    last_follow_target_sample_deg_ = state.actual_angle_deg;
+    interp_start_velocity_deg_s_ = state.actual_velocity_deg_s;
+    interp_target_velocity_deg_s_ = state.actual_velocity_deg_s;
+    interpolated_velocity_deg_s_ = state.actual_velocity_deg_s;
+    interp_step_ = 0;
+}
+
+void ErobAxis::updateTargetTrajectory(double angle_deg, int64_t now_ns) {
+    const double clamped_target = clampAngle(angle_deg);
+    const bool first_sample = follow_first_update_pending_.load(std::memory_order_acquire);
+    const int64_t previous_ns = last_follow_target_ns_.load(std::memory_order_acquire);
+    const double nominal_dt = 1.0 / std::max(1.0, config_.follow.control_rate_hz);
+
+    if (first_sample || previous_ns <= 0 || now_ns <= previous_ns) {
+        target_track_velocity_deg_s_ = 0.0;
+        target_track_accel_deg_s2_ = 0.0;
+    } else {
+        const double sample_dt = Clamp(
+            static_cast<double>(now_ns - previous_ns) * kNsToSeconds,
+            std::max(1e-4, nominal_dt * 0.25),
+            std::max(nominal_dt * 4.0, nominal_dt));
+        const double target_velocity_limit = std::max(
+            config_.follow.max_velocity_deg_s,
+            config_.max_velocity_deg_s * 0.75);
+        const double previous_velocity = target_track_velocity_deg_s_;
+        const double raw_velocity = Clamp(
+            (clamped_target - last_follow_target_sample_deg_) / sample_dt,
+            -target_velocity_limit,
+            target_velocity_limit);
+        const double velocity_alpha = Clamp(
+            config_.follow.target_filter_alpha + sample_dt / std::max(nominal_dt, 1e-3) * 0.15,
+            0.15,
+            0.85);
+        target_track_velocity_deg_s_ += velocity_alpha * (raw_velocity - target_track_velocity_deg_s_);
+
+        const double accel_limit = std::max(config_.follow.max_accel_deg_s2, config_.follow.max_decel_deg_s2) * 1.5;
+        const double raw_accel = Clamp(
+            (target_track_velocity_deg_s_ - previous_velocity) / sample_dt,
+            -accel_limit,
+            accel_limit);
+        const double accel_alpha = Clamp(velocity_alpha * 0.5, 0.08, 0.55);
+        target_track_accel_deg_s2_ += accel_alpha * (raw_accel - target_track_accel_deg_s2_);
+    }
+
+    follow_target_deg_.store(clamped_target, std::memory_order_release);
+    last_follow_target_sample_deg_ = clamped_target;
+    last_follow_target_ns_.store(now_ns, std::memory_order_release);
+}
+
+void ErobAxis::updateMeasuredMotion(AxisState* state) {
+    const int64_t now_ns = SteadyClockNowNs();
+    if (last_feedback_ns_ <= 0) {
+        last_feedback_ns_ = now_ns;
+        last_feedback_velocity_deg_s_ = state->actual_velocity_deg_s;
+        measured_accel_deg_s2_ = 0.0;
+        measured_jerk_deg_s3_ = 0.0;
+    } else {
+        const double dt = static_cast<double>(now_ns - last_feedback_ns_) * kNsToSeconds;
+        if (dt > 1e-6 && dt < 0.1) {
+            const double previous_accel = measured_accel_deg_s2_;
+            const double raw_accel = (state->actual_velocity_deg_s - last_feedback_velocity_deg_s_) / dt;
+            const double accel_alpha = Clamp(dt * 120.0, 0.08, 0.35);
+            measured_accel_deg_s2_ += accel_alpha * (raw_accel - measured_accel_deg_s2_);
+
+            const double raw_jerk = (measured_accel_deg_s2_ - previous_accel) / dt;
+            const double jerk_alpha = Clamp(dt * 80.0, 0.05, 0.25);
+            measured_jerk_deg_s3_ += jerk_alpha * (raw_jerk - measured_jerk_deg_s3_);
+        } else if (dt >= 0.1) {
+            measured_accel_deg_s2_ = 0.0;
+            measured_jerk_deg_s3_ = 0.0;
+        }
+        last_feedback_ns_ = now_ns;
+        last_feedback_velocity_deg_s_ = state->actual_velocity_deg_s;
+    }
+
+    state->actual_accel_deg_s2 = measured_accel_deg_s2_;
+    state->actual_jerk_deg_s3 = measured_jerk_deg_s3_;
+}
+
+double ErobAxis::planFollowVelocityForCycle(const AxisState& state, double dt, int64_t now_ns) {
+    if (state.fault || state.cia402_state == CiA402State::kQuickStopActive) {
+        setFollowModeState(FollowModeState::kFault);
+        planner_velocity_deg_s_ = 0.0;
+        planner_accel_deg_s2_ = 0.0;
+        return 0.0;
+    }
+    if (!state.online || !state.enabled) {
+        setFollowModeState(FollowModeState::kWaitingEnable);
+        planner_velocity_deg_s_ = 0.0;
+        planner_accel_deg_s2_ = 0.0;
+        return 0.0;
+    }
+
+    const double clamped_target = clampAngle(follow_target_deg_.load(std::memory_order_acquire));
+    const double nominal_target_dt = 1.0 / std::max(1.0, config_.follow.control_rate_hz);
+    const double watchdog_sec = std::max(1e-3, config_.follow.watchdog_timeout_ms * 0.001);
+    double stale_sec = std::max(
+        0.0,
+        static_cast<double>(now_ns - last_follow_target_ns_.load(std::memory_order_acquire)) * kNsToSeconds);
+    const bool target_stale = stale_sec > watchdog_sec;
+
+    double reference_target_deg = clamped_target;
+    double reference_velocity_deg_s = target_track_velocity_deg_s_;
+    double reference_accel_deg_s2 = target_track_accel_deg_s2_;
+    if (target_stale) {
+        reference_velocity_deg_s = 0.0;
+        reference_accel_deg_s2 = 0.0;
+        stale_sec = 0.0;
+    } else {
+        const double lookahead_sec = Clamp(
+            nominal_target_dt * 0.5 + 2.0 * dt,
+            2.0 * dt,
+            std::min(0.03, watchdog_sec));
+        const double prediction_sec = Clamp(stale_sec + lookahead_sec, 0.0, watchdog_sec);
+        reference_target_deg +=
+            reference_velocity_deg_s * prediction_sec +
+            0.5 * reference_accel_deg_s2 * prediction_sec * prediction_sec;
+        reference_velocity_deg_s += reference_accel_deg_s2 * prediction_sec;
+    }
+
+    const double limit_hold_band_deg = std::max(2.0, config_.follow.position_limit_margin_deg * 0.4);
+    const double limit_settle_deg = 1.0;
+    const double limit_capture_velocity_deg_s =
+        std::max(2.0, config_.follow.max_velocity_deg_s * 0.03);
+    const double limit_soft_target_offset_deg = limit_hold_band_deg;
+    const double limit_release_band_deg = limit_hold_band_deg + 1.0;
+    const bool target_at_positive_limit = clamped_target >= (config_.max_angle_deg - 1e-6);
+    const bool target_at_negative_limit = clamped_target <= (config_.min_angle_deg + 1e-6);
+    const bool target_near_positive_limit = clamped_target >= (config_.max_angle_deg - limit_hold_band_deg);
+    const bool target_near_negative_limit = clamped_target <= (config_.min_angle_deg + limit_hold_band_deg);
+
+    if (target_at_positive_limit) {
+        reference_target_deg = std::min(reference_target_deg, config_.max_angle_deg - limit_soft_target_offset_deg);
+    } else if (target_at_negative_limit) {
+        reference_target_deg = std::max(reference_target_deg, config_.min_angle_deg + limit_soft_target_offset_deg);
+    }
+    reference_target_deg = clampAngle(reference_target_deg);
+
+    if (follow_positive_limit_hold_ && clamped_target < (config_.max_angle_deg - limit_release_band_deg)) {
+        follow_positive_limit_hold_ = false;
+    }
+    if (follow_negative_limit_hold_ && clamped_target > (config_.min_angle_deg + limit_release_band_deg)) {
+        follow_negative_limit_hold_ = false;
+    }
+
+    planner_filtered_target_deg_ = reference_target_deg;
+    const double position_error_for_hold = std::fabs(reference_target_deg - state.actual_angle_deg);
+    if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
+        const bool can_capture_positive_limit =
+            target_near_positive_limit &&
+            state.actual_angle_deg >= (config_.max_angle_deg - limit_hold_band_deg) &&
+            (position_error_for_hold < limit_settle_deg ||
+             (std::fabs(state.actual_velocity_deg_s) <= limit_capture_velocity_deg_s &&
+              std::fabs(reference_velocity_deg_s) <= limit_capture_velocity_deg_s));
+        const bool can_capture_negative_limit =
+            target_near_negative_limit &&
+            state.actual_angle_deg <= (config_.min_angle_deg + limit_hold_band_deg) &&
+            (position_error_for_hold < limit_settle_deg ||
+             (std::fabs(state.actual_velocity_deg_s) <= limit_capture_velocity_deg_s &&
+              std::fabs(reference_velocity_deg_s) <= limit_capture_velocity_deg_s));
+        if (can_capture_positive_limit) {
+            follow_positive_limit_hold_ = true;
+        } else if (can_capture_negative_limit) {
+            follow_negative_limit_hold_ = true;
+        }
+    }
+
+    const bool holding_limit = follow_positive_limit_hold_ || follow_negative_limit_hold_;
+    if (holding_limit) {
+        planner_filtered_target_deg_ = Clamp(
+            state.actual_angle_deg,
+            config_.min_angle_deg,
+            config_.max_angle_deg);
+        reference_velocity_deg_s = 0.0;
+        reference_accel_deg_s2 = 0.0;
+    }
+
+    const double position_error_deg = planner_filtered_target_deg_ - state.actual_angle_deg;
+    const double position_error_abs_deg = std::fabs(position_error_deg);
+    const double velocity_error_deg_s = reference_velocity_deg_s - state.actual_velocity_deg_s;
+    const double accel_error_deg_s2 = reference_accel_deg_s2 - state.actual_accel_deg_s2;
+    const double response_bandwidth = Clamp(1.35 * std::sqrt(std::max(0.25, config_.follow.kp)), 3.0, 10.0);
+    const double damping_ratio = Clamp(0.82 + config_.follow.kd * 1.6, 0.75, 1.45);
+    const double accel_feedback_gain = Clamp(0.12 * response_bandwidth, 0.0, 1.5);
+    const double jerk_damping_gain = Clamp(0.03 * response_bandwidth, 0.02, 0.25);
+
+    double desired_velocity_deg_s = reference_velocity_deg_s + response_bandwidth * position_error_deg;
+    double desired_accel_deg_s2 =
+        reference_accel_deg_s2 +
+        2.0 * damping_ratio * response_bandwidth * velocity_error_deg_s +
+        response_bandwidth * response_bandwidth * position_error_deg +
+        accel_feedback_gain * accel_error_deg_s2 -
+        jerk_damping_gain * state.actual_jerk_deg_s3 * dt;
+
+    const double terminal_track_band_deg = 2.0;
+    const double terminal_min_velocity_deg_s = 1.0;
+    const double quasi_static_reference_deg_s = std::max(3.0, config_.follow.max_velocity_deg_s * 0.12);
+    if (!holding_limit &&
+        position_error_abs_deg > config_.follow.deadband_deg &&
+        position_error_abs_deg < terminal_track_band_deg &&
+        std::fabs(reference_velocity_deg_s) < quasi_static_reference_deg_s) {
+        const double comfortable_terminal_decel = std::max(
+            1e-3,
+            std::min(config_.follow.max_accel_deg_s2, config_.follow.max_decel_deg_s2) * 0.35);
+        const double terminal_velocity_limit_deg_s = std::sqrt(
+            std::max(
+                0.0,
+                2.0 * comfortable_terminal_decel *
+                    std::max(0.0, position_error_abs_deg - config_.follow.deadband_deg * 0.4)));
+        const double terminal_floor_fade_start_deg = std::max(
+            config_.follow.deadband_deg + 0.15,
+            (terminal_min_velocity_deg_s * terminal_min_velocity_deg_s) /
+                (2.0 * comfortable_terminal_decel));
+        const double terminal_floor_ratio = Clamp(
+            (position_error_abs_deg - config_.follow.deadband_deg) /
+                std::max(terminal_floor_fade_start_deg - config_.follow.deadband_deg, 1e-3),
+            0.0,
+            1.0);
+        const double terminal_velocity_floor_deg_s =
+            terminal_min_velocity_deg_s * terminal_floor_ratio;
+        double terminal_velocity_mag_deg_s = std::fabs(desired_velocity_deg_s);
+        terminal_velocity_mag_deg_s = std::max(terminal_velocity_mag_deg_s, terminal_velocity_floor_deg_s);
+        terminal_velocity_mag_deg_s = std::min(terminal_velocity_mag_deg_s, terminal_velocity_limit_deg_s);
+        desired_velocity_deg_s = std::copysign(terminal_velocity_mag_deg_s, position_error_deg);
+
+        const double terminal_accel_request_deg_s2 =
+            (desired_velocity_deg_s - state.actual_velocity_deg_s) /
+            std::max(3.0 * dt, 1e-3);
+        desired_accel_deg_s2 = 0.75 * desired_accel_deg_s2 + 0.25 * terminal_accel_request_deg_s2;
+    }
+
+    if (holding_limit) {
+        desired_velocity_deg_s = 0.0;
+        desired_accel_deg_s2 = 0.0;
+    } else if (position_error_abs_deg <= config_.follow.deadband_deg &&
+               std::fabs(reference_velocity_deg_s) < 0.5 &&
+               std::fabs(state.actual_velocity_deg_s) < 0.5) {
+        desired_velocity_deg_s = 0.0;
+        desired_accel_deg_s2 = -2.0 * damping_ratio * response_bandwidth * state.actual_velocity_deg_s;
+    }
+
+    if (state.motion_mode != MotionMode::kCyclicSyncVelocity) {
+        setFollowModeState(FollowModeState::kEnteringCsvMode);
+    } else {
+        setFollowModeState(FollowModeState::kFollowing);
+    }
+
+    desired_velocity_deg_s = applyVelocityLimiter(state, desired_velocity_deg_s);
+    return advanceVelocityPlanner(state, desired_velocity_deg_s, desired_accel_deg_s2, dt);
+}
+
+double ErobAxis::advanceVelocityPlanner(
+    const AxisState& state,
+    double desired_velocity_deg_s,
+    double desired_accel_deg_s2,
+    double dt) {
+    const double max_accel = std::max(1e-3, config_.follow.max_accel_deg_s2);
+    const double max_decel = std::max(1e-3, config_.follow.max_decel_deg_s2);
+    const double nominal_target_dt = 1.0 / std::max(1.0, config_.follow.control_rate_hz);
+    const double jerk_limit =
+        std::max(max_accel, max_decel) / std::max(0.002, nominal_target_dt * 0.6);
+    const double accel_step = jerk_limit * dt;
+    const double accel_target = Clamp(desired_accel_deg_s2, -max_decel, max_accel);
+    if (accel_target > planner_accel_deg_s2_) {
+        planner_accel_deg_s2_ = std::min(accel_target, planner_accel_deg_s2_ + accel_step);
+    } else {
+        planner_accel_deg_s2_ = std::max(accel_target, planner_accel_deg_s2_ - accel_step);
+    }
+
+    double next_velocity_deg_s = planner_velocity_deg_s_ + planner_accel_deg_s2_ * dt;
+    const double limited_desired_velocity = applyVelocityLimiter(state, desired_velocity_deg_s);
+    next_velocity_deg_s = applyVelocityLimiter(state, next_velocity_deg_s);
+
+    const double snap_velocity_band = std::max(0.05, std::fabs(planner_accel_deg_s2_) * dt * 1.5);
+    if (std::fabs(limited_desired_velocity - next_velocity_deg_s) <= snap_velocity_band) {
+        next_velocity_deg_s = limited_desired_velocity;
+        planner_accel_deg_s2_ = 0.0;
+    }
+    if (std::fabs(limited_desired_velocity) < 0.02 &&
+        std::fabs(next_velocity_deg_s) < 0.05 &&
+        std::fabs(state.actual_velocity_deg_s) < 0.1) {
+        next_velocity_deg_s = 0.0;
+        planner_accel_deg_s2_ = 0.0;
+    }
+
+    planner_velocity_deg_s_ = next_velocity_deg_s;
+    return next_velocity_deg_s;
 }
 
 uint16_t ErobAxis::computeControlword(const AxisState& state, const AxisCommand& command) const {
