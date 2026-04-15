@@ -82,6 +82,7 @@ struct FollowParams {
     double max_velocity_deg_s = 60.0;
     double max_accel_deg_s2 = 800.0;
     double max_decel_deg_s2 = 800.0;
+    double max_jerk_deg_s3 = 3600.0;
     double target_filter_alpha = 0.4;
     double watchdog_timeout_ms = 50.0;
     double position_limit_margin_deg = 5.0;
@@ -190,6 +191,9 @@ struct AxisState {
     int16_t actual_torque = 0;
     double actual_angle_deg = 0.0;
     double actual_velocity_deg_s = 0.0;
+    double follow_filtered_target_deg = 0.0;
+    double follow_planner_velocity_deg_s = 0.0;
+    double follow_output_velocity_deg_s = 0.0;
     double target_angle_deg = 0.0;
     double position_error_deg = 0.0;
     bool target_reached = false;

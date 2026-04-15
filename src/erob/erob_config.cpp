@@ -144,6 +144,10 @@ bool SetFollowField(FollowParams* follow, const std::string& key, const std::str
         follow->max_decel_deg_s2 = std::stod(value);
         return true;
     }
+    if (key == "max_jerk_deg_s3") {
+        follow->max_jerk_deg_s3 = std::stod(value);
+        return true;
+    }
     if (key == "target_filter_alpha") {
         follow->target_filter_alpha = std::stod(value);
         return true;
@@ -392,6 +396,7 @@ bool ConfigManager::saveToFile(const std::string& path, const SystemConfig& conf
         output << "      deadband_deg: " << axis.follow.deadband_deg << "\n";
         output << "      max_accel_deg_s2: " << axis.follow.max_accel_deg_s2 << "\n";
         output << "      max_decel_deg_s2: " << axis.follow.max_decel_deg_s2 << "\n";
+        output << "      max_jerk_deg_s3: " << axis.follow.max_jerk_deg_s3 << "\n";
         output << "      target_filter_alpha: " << axis.follow.target_filter_alpha << "\n";
         output << "      watchdog_timeout_ms: " << axis.follow.watchdog_timeout_ms << "\n";
         output << "      position_limit_margin_deg: " << axis.follow.position_limit_margin_deg << "\n\n";

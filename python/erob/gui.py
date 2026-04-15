@@ -353,9 +353,23 @@ class MainWindow(QMainWindow):
 
         panel = self._wrap_panel("轴状态总览", QWidget())
         panel_layout = panel.layout()
-        self.axis_table = QTableWidget(len(self.axis_metadata), 11)
+        self.axis_table = QTableWidget(len(self.axis_metadata), 13)
         self.axis_table.setHorizontalHeaderLabels(
-            ["选中", "轴", "关节", "在线", "使能", "故障", "当前角度", "目标角度", "速度", "模式", "绑定"]
+            [
+                "选中",
+                "轴",
+                "关节",
+                "在线",
+                "使能",
+                "故障",
+                "当前角度",
+                "目标角度",
+                "规划速度",
+                "CSV输出",
+                "反馈速度",
+                "模式",
+                "绑定",
+            ]
         )
         self.axis_table.horizontalHeader().setStretchLastSection(True)
         self.axis_table.verticalHeader().setVisible(False)
@@ -589,6 +603,8 @@ class MainWindow(QMainWindow):
                 "故障" if state and state.fault else "正常",
                 f"{state.actual_angle_deg:.1f}°" if state else "-",
                 f"{state.target_angle_deg:.1f}°" if state else "-",
+                f"{state.follow_planner_velocity_deg_s:.1f}°/s" if state else "-",
+                f"{state.follow_output_velocity_deg_s:.1f}°/s" if state else "-",
                 f"{state.actual_velocity_deg_s:.1f}°/s" if state else "-",
                 (
                     f"{state.motion_mode_name}/{state.follow_mode_name}/{state.position_mode_name}"

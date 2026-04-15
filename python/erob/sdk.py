@@ -46,6 +46,9 @@ class _AxisStateStruct(ctypes.Structure):
         ("actual_torque", ctypes.c_int16),
         ("actual_angle_deg", ctypes.c_double),
         ("actual_velocity_deg_s", ctypes.c_double),
+        ("follow_filtered_target_deg", ctypes.c_double),
+        ("follow_planner_velocity_deg_s", ctypes.c_double),
+        ("follow_output_velocity_deg_s", ctypes.c_double),
         ("target_angle_deg", ctypes.c_double),
         ("position_error_deg", ctypes.c_double),
         ("target_reached", ctypes.c_int),
@@ -91,6 +94,9 @@ class AxisState:
     actual_torque: int
     actual_angle_deg: float
     actual_velocity_deg_s: float
+    follow_filtered_target_deg: float
+    follow_planner_velocity_deg_s: float
+    follow_output_velocity_deg_s: float
     target_angle_deg: float
     position_error_deg: float
     target_reached: bool
@@ -569,6 +575,9 @@ class ErobController:
             actual_torque=int(raw.actual_torque),
             actual_angle_deg=float(raw.actual_angle_deg),
             actual_velocity_deg_s=float(raw.actual_velocity_deg_s),
+            follow_filtered_target_deg=float(raw.follow_filtered_target_deg),
+            follow_planner_velocity_deg_s=float(raw.follow_planner_velocity_deg_s),
+            follow_output_velocity_deg_s=float(raw.follow_output_velocity_deg_s),
             target_angle_deg=float(raw.target_angle_deg),
             position_error_deg=float(raw.position_error_deg),
             target_reached=bool(raw.target_reached),

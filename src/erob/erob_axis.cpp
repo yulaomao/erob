@@ -33,6 +33,43 @@ double ModeSwitchVelocityToleranceDegS(const AxisConfig& config) {
     return std::min(0.5, config.max_velocity_deg_s * 0.02);
 }
 
+double ComputeJerkAwareBrakingVelocityLimit(
+    double remaining_error_deg,
+    double max_decel_deg_s2,
+    double max_jerk_deg_s3) {
+    if (remaining_error_deg <= 0.0) {
+        return 0.0;
+    }
+
+    const double decel = std::max(1e-3, max_decel_deg_s2);
+    const double jerk = std::max(1e-3, max_jerk_deg_s3);
+    const double jerk_penalty = (decel * decel) / jerk;
+    return 0.5 * (-jerk_penalty + std::sqrt(jerk_penalty * jerk_penalty + 8.0 * decel * remaining_error_deg));
+}
+
+bool IsDeceleratingToTarget(double current_velocity_deg_s, double target_velocity_deg_s) {
+    if (std::fabs(current_velocity_deg_s) < 1e-9) {
+        return false;
+    }
+    if (std::fabs(target_velocity_deg_s) < 1e-9) {
+        return true;
+    }
+    if ((current_velocity_deg_s > 0.0) != (target_velocity_deg_s > 0.0)) {
+        return true;
+    }
+    return std::fabs(target_velocity_deg_s) < std::fabs(current_velocity_deg_s);
+}
+
+int SignWithTolerance(double value, double tolerance) {
+    if (value > tolerance) {
+        return 1;
+    }
+    if (value < -tolerance) {
+        return -1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 
@@ -107,10 +144,12 @@ bool ErobAxis::disable() {
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
+    planner_accel_deg_s2_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
     interpolated_velocity_deg_s_ = 0.0;
     interp_step_ = 0;
+    resetFollowDiagnostics();
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kProfilePosition;
     command.target_angle_deg = state.actual_angle_deg;
@@ -139,10 +178,12 @@ bool ErobAxis::resetFault() {
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
+    planner_accel_deg_s2_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
     interpolated_velocity_deg_s_ = 0.0;
     interp_step_ = 0;
+    resetFollowDiagnostics();
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kProfilePosition;
     command.target_angle_deg = state.actual_angle_deg;
@@ -171,10 +212,12 @@ bool ErobAxis::quickStop() {
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
+    planner_accel_deg_s2_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
     interpolated_velocity_deg_s_ = 0.0;
     interp_step_ = 0;
+    resetFollowDiagnostics();
 
     AxisCommand command = command_buffer_.load();
     command.target_angle_deg = state.actual_angle_deg;
@@ -230,10 +273,12 @@ bool ErobAxis::setProfilePositionTarget(
     follow_positive_limit_hold_ = false;
     follow_negative_limit_hold_ = false;
     planner_velocity_deg_s_ = 0.0;
+    planner_accel_deg_s2_ = 0.0;
     interp_start_velocity_deg_s_ = 0.0;
     interp_target_velocity_deg_s_ = 0.0;
     interpolated_velocity_deg_s_ = 0.0;
     interp_step_ = 0;
+    resetFollowDiagnostics();
 
     command.requested_mode = MotionMode::kProfilePosition;
     command.target_angle_deg = clamped_angle;
@@ -305,6 +350,14 @@ bool ErobAxis::enterFollowMode(uint64_t* request_id) {
     follow_target_deg_.store(state.actual_angle_deg, std::memory_order_release);
     planner_filtered_target_deg_ = state.actual_angle_deg;
     planner_velocity_deg_s_ = 0.0;
+    planner_accel_deg_s2_ = 0.0;
+    resetFollowDiagnostics();
+
+    AxisState next_state = state_buffer_.load();
+    next_state.follow_filtered_target_deg = planner_filtered_target_deg_;
+    next_state.follow_planner_velocity_deg_s = planner_velocity_deg_s_;
+    next_state.follow_output_velocity_deg_s = interpolated_velocity_deg_s_;
+    state_buffer_.publish(next_state);
 
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kCyclicSyncVelocity;
@@ -399,9 +452,11 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
     profile_transition_pending_ = false;
     pp_pulse_cycles_remaining_ = 0;
     planner_velocity_deg_s_ = 0.0;
+    planner_accel_deg_s2_ = 0.0;
     interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
     interp_target_velocity_deg_s_ = 0.0;
     interp_step_ = 0;
+    resetFollowDiagnostics();
 
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kCyclicSyncVelocity;
@@ -415,6 +470,13 @@ bool ErobAxis::stopFollowMode(uint64_t* request_id) {
     pending_profile_target_deg_ = state.actual_angle_deg;
     pending_profile_velocity_deg_s_ = 0.0;
     target_position_count_ = state.actual_position_count;
+    {
+        AxisState next_state = state_buffer_.load();
+        next_state.follow_filtered_target_deg = planner_filtered_target_deg_;
+        next_state.follow_planner_velocity_deg_s = planner_velocity_deg_s_;
+        next_state.follow_output_velocity_deg_s = interpolated_velocity_deg_s_;
+        state_buffer_.publish(next_state);
+    }
     setFollowModeState(FollowModeState::kStopping);
     if (request_id != nullptr) {
         *request_id = new_request_id;
@@ -433,10 +495,12 @@ void ErobAxis::planFollowStep() {
     if (state.fault || state.cia402_state == CiA402State::kQuickStopActive) {
         setFollowModeState(FollowModeState::kFault);
         planner_velocity_deg_s_ = 0.0;
+        planner_accel_deg_s2_ = 0.0;
         return;
     }
     if (!state.online || !state.enabled) {
         planner_velocity_deg_s_ = 0.0;
+        planner_accel_deg_s2_ = 0.0;
 
         AxisCommand command = command_buffer_.load();
         command.requested_mode = MotionMode::kCyclicSyncVelocity;
@@ -450,6 +514,10 @@ void ErobAxis::planFollowStep() {
     }
 
     const double dt = 1.0 / std::max(1.0, config_.follow.control_rate_hz);
+    const double velocity_tolerance_deg_s = ModeSwitchVelocityToleranceDegS(config_);
+    const double settle_error_deg = std::max(0.1, config_.follow.deadband_deg * 3.0);
+    const double now_target_age_ms =
+        static_cast<double>(SteadyClockNowNs() - last_follow_target_ns_.load(std::memory_order_acquire)) / 1.0e6;
 
     double desired_velocity = 0.0;
     const double raw_target = follow_target_deg_.load(std::memory_order_acquire);
@@ -482,10 +550,23 @@ void ErobAxis::planFollowStep() {
         follow_negative_limit_hold_ = false;
     }
 
+    double filtered_error_deg = planner_filtered_target_deg_ - state.actual_angle_deg;
+    double abs_filtered_error_deg = std::fabs(filtered_error_deg);
+    double braking_velocity_limit_deg_s = 0.0;
     if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
-        const double error = planner_filtered_target_deg_ - state.actual_angle_deg;
-        if (std::fabs(error) > config_.follow.deadband_deg) {
-            desired_velocity = config_.follow.kp * error - config_.follow.kd * state.actual_velocity_deg_s;
+        if (abs_filtered_error_deg > config_.follow.deadband_deg) {
+            desired_velocity =
+                config_.follow.kp * filtered_error_deg - config_.follow.kd * state.actual_velocity_deg_s;
+            const double braking_error_deg =
+                std::max(0.0, abs_filtered_error_deg - config_.follow.deadband_deg);
+            braking_velocity_limit_deg_s = ComputeJerkAwareBrakingVelocityLimit(
+                braking_error_deg,
+                config_.follow.max_decel_deg_s2,
+                config_.follow.max_jerk_deg_s3);
+            desired_velocity = Clamp(
+                desired_velocity,
+                -braking_velocity_limit_deg_s,
+                braking_velocity_limit_deg_s);
         }
     }
 
@@ -495,14 +576,67 @@ void ErobAxis::planFollowStep() {
         config_.follow.max_velocity_deg_s);
 
     if (!(follow_positive_limit_hold_ || follow_negative_limit_hold_)) {
-        const double max_accel = desired_velocity >= planner_velocity_deg_s_
-            ? config_.follow.max_accel_deg_s2
-            : config_.follow.max_decel_deg_s2;
-        const double accel_step = max_accel * dt;
-        if (desired_velocity > planner_velocity_deg_s_) {
-            desired_velocity = std::min(desired_velocity, planner_velocity_deg_s_ + accel_step);
+        const double tracked_output_velocity_deg_s = interpolated_velocity_deg_s_;
+        const int error_sign = SignWithTolerance(filtered_error_deg, config_.follow.deadband_deg);
+        const int tracked_output_sign = SignWithTolerance(
+            tracked_output_velocity_deg_s,
+            velocity_tolerance_deg_s);
+        const bool reversal_requested =
+            error_sign != 0 && tracked_output_sign != 0 && error_sign != tracked_output_sign;
+        const double near_target_error_window_deg =
+            std::max(2.0, config_.follow.deadband_deg * 12.0);
+        const bool decelerating = IsDeceleratingToTarget(tracked_output_velocity_deg_s, desired_velocity);
+        const double max_accel = decelerating
+            ? config_.follow.max_decel_deg_s2
+            : config_.follow.max_accel_deg_s2;
+        double target_accel = Clamp(
+            (desired_velocity - tracked_output_velocity_deg_s) / dt,
+            -max_accel,
+            max_accel);
+
+        if (reversal_requested) {
+            // Once the axis has crossed the target, stop carrying old-direction acceleration.
+            target_accel = static_cast<double>(error_sign) * max_accel;
+            if (planner_accel_deg_s2_ * tracked_output_velocity_deg_s > 0.0) {
+                planner_accel_deg_s2_ = 0.0;
+            }
+        }
+
+        double jerk_unload_multiplier = 1.0;
+        if (reversal_requested) {
+            jerk_unload_multiplier = 6.0;
+        } else if (abs_filtered_error_deg <= near_target_error_window_deg) {
+            jerk_unload_multiplier = 3.0;
+        }
+        const double jerk_step =
+            std::max(1e-3, config_.follow.max_jerk_deg_s3) * jerk_unload_multiplier * dt;
+        if (target_accel > planner_accel_deg_s2_) {
+            planner_accel_deg_s2_ = std::min(target_accel, planner_accel_deg_s2_ + jerk_step);
         } else {
-            desired_velocity = std::max(desired_velocity, planner_velocity_deg_s_ - accel_step);
+            planner_accel_deg_s2_ = std::max(target_accel, planner_accel_deg_s2_ - jerk_step);
+        }
+
+        const double next_velocity = tracked_output_velocity_deg_s + planner_accel_deg_s2_ * dt;
+        if (desired_velocity >= tracked_output_velocity_deg_s) {
+            desired_velocity = std::min(desired_velocity, next_velocity);
+        } else {
+            desired_velocity = std::max(desired_velocity, next_velocity);
+        }
+
+        if (abs_filtered_error_deg > config_.follow.deadband_deg) {
+            desired_velocity = Clamp(
+                desired_velocity,
+                -braking_velocity_limit_deg_s,
+                braking_velocity_limit_deg_s);
+        }
+
+        const int output_sign = SignWithTolerance(desired_velocity, velocity_tolerance_deg_s);
+        const bool output_worsens_error =
+            error_sign != 0 && output_sign != 0 && error_sign != output_sign;
+        if (output_worsens_error) {
+            // Zero-crossing guard: never keep commanding velocity that enlarges the error.
+            desired_velocity = 0.0;
+            planner_accel_deg_s2_ = 0.0;
         }
     }
 
@@ -534,9 +668,47 @@ void ErobAxis::planFollowStep() {
             config_.min_angle_deg,
             config_.max_angle_deg);
         desired_velocity = 0.0;
+        planner_accel_deg_s2_ = 0.0;
+    }
+
+    desired_velocity = applyVelocityLimiter(state, desired_velocity);
+
+    filtered_error_deg = planner_filtered_target_deg_ - state.actual_angle_deg;
+    abs_filtered_error_deg = std::fabs(filtered_error_deg);
+
+    const bool settled_on_target =
+        !holding_limit &&
+        abs_filtered_error_deg <= settle_error_deg &&
+        std::fabs(state.actual_velocity_deg_s) <= velocity_tolerance_deg_s &&
+        std::fabs(desired_velocity) <= velocity_tolerance_deg_s;
+    if (settled_on_target) {
+        planner_filtered_target_deg_ = Clamp(
+            state.actual_angle_deg,
+            config_.min_angle_deg,
+            config_.max_angle_deg);
+        desired_velocity = 0.0;
+        planner_velocity_deg_s_ = 0.0;
+        planner_accel_deg_s2_ = 0.0;
     }
 
     planner_velocity_deg_s_ = desired_velocity;
+    maybeLogFollowDiagnostics(
+        state,
+        raw_target,
+        clamped_target,
+        effective_target_deg,
+        filtered_error_deg,
+        desired_velocity,
+        now_target_age_ms,
+        holding_limit);
+
+    {
+        AxisState next_state = state_buffer_.load();
+        next_state.follow_filtered_target_deg = planner_filtered_target_deg_;
+        next_state.follow_planner_velocity_deg_s = planner_velocity_deg_s_;
+        next_state.follow_output_velocity_deg_s = interpolated_velocity_deg_s_;
+        state_buffer_.publish(next_state);
+    }
 
     AxisCommand command = command_buffer_.load();
     command.requested_mode = MotionMode::kCyclicSyncVelocity;
@@ -569,6 +741,9 @@ void ErobAxis::updateFeedback(const TxPdoCommon& txpdo, int al_status_code) {
         state.cia402_state == CiA402State::kFaultReactionActive;
     state.actual_angle_deg = countToAngle(txpdo.actual_position);
     state.actual_velocity_deg_s = countToVelocity(txpdo.actual_velocity);
+    state.follow_filtered_target_deg = planner_filtered_target_deg_;
+    state.follow_planner_velocity_deg_s = planner_velocity_deg_s_;
+    state.follow_output_velocity_deg_s = interpolated_velocity_deg_s_;
     state.target_angle_deg = follow_active_.load(std::memory_order_acquire)
         ? follow_target_deg_.load(std::memory_order_acquire)
         : command.target_angle_deg;
@@ -691,7 +866,11 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
                    command.requested_mode == MotionMode::kCyclicSyncVelocity) {
             interp_start_velocity_deg_s_ = interpolated_velocity_deg_s_;
             interp_target_velocity_deg_s_ = command.target_velocity_deg_s;
-            interp_steps_ = std::max(1, cycle_hz / std::max(1, static_cast<int>(config_.follow.control_rate_hz)));
+            if (follow_active_.load(std::memory_order_acquire)) {
+                interp_steps_ = 1;
+            } else {
+                interp_steps_ = std::max(1, cycle_hz / std::max(1, static_cast<int>(config_.follow.control_rate_hz)));
+            }
             interp_step_ = 0;
             if (follow_active_.load(std::memory_order_acquire)) {
                 setFollowModeState(FollowModeState::kEnteringCsvMode);
@@ -758,6 +937,9 @@ RxPdoUnified ErobAxis::buildRxPdoForCycle(int cycle_hz) {
 
     AxisState next_state = state;
     next_state.controlword = pdo.controlword;
+    next_state.follow_filtered_target_deg = planner_filtered_target_deg_;
+    next_state.follow_planner_velocity_deg_s = planner_velocity_deg_s_;
+    next_state.follow_output_velocity_deg_s = interpolated_velocity_deg_s_;
     state_buffer_.publish(next_state);
 
     return pdo;
@@ -786,6 +968,33 @@ uint64_t ErobAxis::profileRequestId() const {
 uint64_t ErobAxis::followRequestId() const {
     std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
     return follow_request_id_.load(std::memory_order_acquire);
+}
+
+std::string ErobAxis::followDebugString() const {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+    const AxisState state = state_buffer_.load();
+    std::ostringstream stream;
+    const double target_age_ms =
+        static_cast<double>(SteadyClockNowNs() - last_follow_target_ns_.load(std::memory_order_acquire)) / 1.0e6;
+    stream << std::fixed << std::setprecision(2)
+           << "follow_req=" << follow_request_id_.load(std::memory_order_acquire)
+           << " active=" << (follow_active_.load(std::memory_order_acquire) ? "true" : "false")
+           << " target_age_ms=" << target_age_ms
+           << " raw_target_deg=" << follow_target_deg_.load(std::memory_order_acquire)
+           << " filtered_target_deg=" << planner_filtered_target_deg_
+           << " actual_deg=" << state.actual_angle_deg
+           << " filtered_error_deg=" << (planner_filtered_target_deg_ - state.actual_angle_deg)
+           << " planner_vel_deg_s=" << planner_velocity_deg_s_
+           << " csv_output_vel_deg_s=" << interpolated_velocity_deg_s_
+           << " feedback_vel_deg_s=" << state.actual_velocity_deg_s
+           << " planner_accel_deg_s2=" << planner_accel_deg_s2_
+           << " err_flip_count=" << follow_error_flip_count_
+           << " vel_flip_count=" << follow_feedback_velocity_flip_count_
+           << " pos_limit_hold=" << (follow_positive_limit_hold_ ? "true" : "false")
+           << " neg_limit_hold=" << (follow_negative_limit_hold_ ? "true" : "false")
+           << " follow_state=" << FollowModeStateName(state.follow_mode_state)
+           << " motion_mode=" << MotionModeName(state.motion_mode);
+    return stream.str();
 }
 
 std::string ErobAxis::profilePositionDebugString() const {
@@ -831,6 +1040,103 @@ bool ErobAxis::publishCommand(const AxisCommand& command) {
     }
     command_buffer_.publish(latched_command);
     return true;
+}
+
+void ErobAxis::resetFollowDiagnostics() {
+    follow_last_debug_log_ns_ = 0;
+    follow_last_error_sign_ = 0;
+    follow_last_feedback_velocity_sign_ = 0;
+    follow_error_flip_count_ = 0;
+    follow_feedback_velocity_flip_count_ = 0;
+}
+
+void ErobAxis::maybeLogFollowDiagnostics(
+    const AxisState& state,
+    double raw_target_deg,
+    double clamped_target_deg,
+    double effective_target_deg,
+    double filtered_error_deg,
+    double desired_velocity_deg_s,
+    double target_age_ms,
+    bool holding_limit) {
+    const int64_t now_ns = SteadyClockNowNs();
+    const double velocity_tolerance_deg_s = ModeSwitchVelocityToleranceDegS(config_);
+    const double error_tolerance_deg = std::max(0.1, config_.follow.deadband_deg * 3.0);
+    const double static_target_threshold_ms = std::max(250.0, config_.follow.watchdog_timeout_ms * 4.0);
+    const bool target_is_static = target_age_ms >= static_target_threshold_ms;
+    const int error_sign = SignWithTolerance(filtered_error_deg, error_tolerance_deg);
+    const int feedback_velocity_sign = SignWithTolerance(state.actual_velocity_deg_s, velocity_tolerance_deg_s);
+
+    bool error_flip = false;
+    if (follow_last_error_sign_ != 0 && error_sign != 0 && error_sign != follow_last_error_sign_) {
+        ++follow_error_flip_count_;
+        error_flip = true;
+    }
+    if (error_sign != 0) {
+        follow_last_error_sign_ = error_sign;
+    }
+
+    bool feedback_velocity_flip = false;
+    if (follow_last_feedback_velocity_sign_ != 0 &&
+        feedback_velocity_sign != 0 &&
+        feedback_velocity_sign != follow_last_feedback_velocity_sign_) {
+        ++follow_feedback_velocity_flip_count_;
+        feedback_velocity_flip = true;
+    }
+    if (feedback_velocity_sign != 0) {
+        follow_last_feedback_velocity_sign_ = feedback_velocity_sign;
+    }
+
+    const double planner_output_gap_deg_s = planner_velocity_deg_s_ - interpolated_velocity_deg_s_;
+    const double output_feedback_gap_deg_s = interpolated_velocity_deg_s_ - state.actual_velocity_deg_s;
+    const bool oscillation_suspected =
+        target_is_static &&
+        (error_flip || feedback_velocity_flip ||
+         follow_error_flip_count_ >= 2 || follow_feedback_velocity_flip_count_ >= 2);
+    const bool periodic_log_due =
+        target_is_static && (now_ns - follow_last_debug_log_ns_ >= 250000000LL);
+
+    if (!(oscillation_suspected || periodic_log_due)) {
+        return;
+    }
+
+    follow_last_debug_log_ns_ = now_ns;
+
+    const double pd_velocity_deg_s =
+        config_.follow.kp * filtered_error_deg - config_.follow.kd * state.actual_velocity_deg_s;
+    const double braking_error_deg = std::max(0.0, std::fabs(filtered_error_deg) - config_.follow.deadband_deg);
+    const double braking_velocity_limit_deg_s = ComputeJerkAwareBrakingVelocityLimit(
+        braking_error_deg,
+        config_.follow.max_decel_deg_s2,
+        config_.follow.max_jerk_deg_s3);
+
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(2)
+           << (oscillation_suspected ? "follow oscillation suspected" : "follow periodic diagnostic")
+           << " | target_age_ms=" << target_age_ms
+           << " raw_target_deg=" << raw_target_deg
+           << " clamped_target_deg=" << clamped_target_deg
+           << " effective_target_deg=" << effective_target_deg
+           << " filtered_target_deg=" << planner_filtered_target_deg_
+           << " actual_deg=" << state.actual_angle_deg
+           << " filtered_error_deg=" << filtered_error_deg
+           << " pd_vel_deg_s=" << pd_velocity_deg_s
+           << " brake_limit_deg_s=" << braking_velocity_limit_deg_s
+           << " planner_vel_deg_s=" << planner_velocity_deg_s_
+           << " csv_output_vel_deg_s=" << interpolated_velocity_deg_s_
+           << " feedback_vel_deg_s=" << state.actual_velocity_deg_s
+           << " planner_accel_deg_s2=" << planner_accel_deg_s2_
+           << " planner_output_gap_deg_s=" << planner_output_gap_deg_s
+           << " output_feedback_gap_deg_s=" << output_feedback_gap_deg_s
+           << " err_flip_count=" << follow_error_flip_count_
+           << " vel_flip_count=" << follow_feedback_velocity_flip_count_
+           << " holding_limit=" << (holding_limit ? "true" : "false")
+           << " pos_limit_hold=" << (follow_positive_limit_hold_ ? "true" : "false")
+           << " neg_limit_hold=" << (follow_negative_limit_hold_ ? "true" : "false")
+           << " follow_state=" << FollowModeStateName(state.follow_mode_state)
+           << " motion_mode=" << MotionModeName(state.motion_mode)
+           << " statusword=0x" << std::hex << state.statusword << std::dec;
+    LogAxisDebug(config_, stream.str());
 }
 
 bool ErobAxis::shouldRejectFollowTarget(double angle_deg, const AxisState& state) const {

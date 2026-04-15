@@ -26,6 +26,7 @@ axes:
       deadband_deg: 0.05
       max_accel_deg_s2: 600.0
       max_decel_deg_s2: 600.0
+      max_jerk_deg_s3: 3600.0
       target_filter_alpha: 0.4
       watchdog_timeout_ms: 50.0
       position_limit_margin_deg: 5.0
@@ -50,6 +51,7 @@ axes:
       deadband_deg: 0.05
       max_accel_deg_s2: 550.0
       max_decel_deg_s2: 550.0
+      max_jerk_deg_s3: 3600.0
       target_filter_alpha: 0.4
       watchdog_timeout_ms: 50.0
       position_limit_margin_deg: 5.0
@@ -74,6 +76,7 @@ axes:
       deadband_deg: 0.05
       max_accel_deg_s2: 550.0
       max_decel_deg_s2: 550.0
+      max_jerk_deg_s3: 3600.0
       target_filter_alpha: 0.4
       watchdog_timeout_ms: 50.0
       position_limit_margin_deg: 5.0

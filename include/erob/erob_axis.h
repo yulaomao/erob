@@ -45,6 +45,7 @@ public:
     bool isFollowActive() const;
     uint64_t profileRequestId() const;
     uint64_t followRequestId() const;
+    std::string followDebugString() const;
     std::string profilePositionDebugString() const;
     uint16_t slaveIndex() const;
     bool hasBoundMotor() const;
@@ -59,6 +60,16 @@ private:
     double countToVelocity(int32_t count_per_second) const;
     uint16_t computeControlword(const AxisState& state, const AxisCommand& command) const;
     double applyVelocityLimiter(const AxisState& state, double velocity_deg_s) const;
+    void resetFollowDiagnostics();
+    void maybeLogFollowDiagnostics(
+        const AxisState& state,
+        double raw_target_deg,
+        double clamped_target_deg,
+        double effective_target_deg,
+        double filtered_error_deg,
+        double desired_velocity_deg_s,
+        double target_age_ms,
+        bool holding_limit);
     void setPositionModeState(PositionModeState state);
     void setFollowModeState(FollowModeState state);
     void setLastError(const std::string& message);
@@ -83,6 +94,7 @@ private:
 
     double planner_filtered_target_deg_ = 0.0;
     double planner_velocity_deg_s_ = 0.0;
+    double planner_accel_deg_s2_ = 0.0;
     bool follow_positive_limit_hold_ = false;
     bool follow_negative_limit_hold_ = false;
     bool profile_transition_pending_ = false;
@@ -97,6 +109,11 @@ private:
     double interpolated_velocity_deg_s_ = 0.0;
     int interp_steps_ = 1;
     int interp_step_ = 0;
+    int64_t follow_last_debug_log_ns_ = 0;
+    int follow_last_error_sign_ = 0;
+    int follow_last_feedback_velocity_sign_ = 0;
+    uint64_t follow_error_flip_count_ = 0;
+    uint64_t follow_feedback_velocity_flip_count_ = 0;
 };
 
 }  // namespace erob

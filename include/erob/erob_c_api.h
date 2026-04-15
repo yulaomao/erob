@@ -54,6 +54,9 @@ typedef struct ErobAxisStateValue {
     int16_t actual_torque;
     double actual_angle_deg;
     double actual_velocity_deg_s;
+    double follow_filtered_target_deg;
+    double follow_planner_velocity_deg_s;
+    double follow_output_velocity_deg_s;
     double target_angle_deg;
     double position_error_deg;
     int target_reached;
