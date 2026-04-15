@@ -29,9 +29,11 @@ target_compile_features(erob_c_api PUBLIC cxx_std_17)
 
 add_executable(erob_arm_demo erob_arm_demo.cpp)
 target_link_libraries(erob_arm_demo PRIVATE erob)
+add_executable(erob_guided_demo erob_guided_demo.cpp)
+target_link_libraries(erob_guided_demo PRIVATE erob)
 add_executable(erob_mode_switch_demo erob_mode_switch_demo.cpp)
 target_link_libraries(erob_mode_switch_demo PRIVATE erob)
-install(TARGETS erob erob_c_api erob_arm_demo erob_mode_switch_demo DESTINATION bin)
+install(TARGETS erob erob_c_api erob_arm_demo erob_guided_demo erob_mode_switch_demo DESTINATION bin)
 install(DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/../include/erob DESTINATION include)
 
 add_executable(eRob_CSV eRob_CSV.cpp)
